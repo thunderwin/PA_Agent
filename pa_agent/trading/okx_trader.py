@@ -919,6 +919,15 @@ class OkxTrader:
                 message=f"{symbol} 已有 {pending} 张未成交挂单，跳过（避免重复建仓）",
             )
 
+        # 同一品种已有持仓 → 不再加仓（「每笔最大亏损」是按笔算的，加仓等于风险翻倍）
+        if self._has_open_position_for(symbol):
+            return ExecutionResult(
+                sent=False,
+                guard=guard,
+                dry_run=dry_run,
+                message=f"{symbol} 已有持仓，跳过（不加仓：加仓会让单笔风险翻倍）",
+            )
+
         spec = self.spec_for(symbol)
         plan = plan_order(
             decision,
@@ -1000,6 +1009,17 @@ class OkxTrader:
         except Exception as exc:  # noqa: BLE001
             logger.warning("查询 %s 未成交挂单失败: %s", symbol, exc)
             return None
+
+    def _has_open_position_for(self, symbol: str) -> bool:
+        """该品种是否已有持仓；查询失败时按「有」处理（保守，拒绝加仓）。"""
+        try:
+            for row in self.client.positions(inst_id=symbol):
+                if abs(float(row.get("pos") or 0)) > 0:
+                    return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询 %s 持仓失败（按有持仓处理）: %s", symbol, exc)
+            return True
+        return False
 
     def _daily_pnl_safe(self) -> float | None:
         try:

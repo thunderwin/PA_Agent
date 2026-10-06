@@ -499,6 +499,11 @@ class _FakeClient:
     def algo_pending(self, inst_id=None, ord_type="oco"):
         return list(self.algo)
 
+    def positions(self, inst_id=None, inst_type=None):
+        if self._positions <= 0:
+            return []
+        return [{"instId": inst_id or "BTC-USDT-SWAP", "pos": "1"}]
+
     def realized_pnl_today_usd(self, tz_offset_hours=8):
         return self._pnl
 
@@ -589,6 +594,28 @@ def test_execute_warns_when_no_stop_found():
     result = trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
     assert result.sent is True
     assert "未检测到止损单" in result.message
+
+
+def test_execute_skips_when_symbol_already_has_position():
+    """同一品种已有持仓时不再加仓（加仓会让单笔 10 USDT 的风险翻倍）。"""
+    # 持仓上限设为 4（用户实盘配置），此时总数闸门不会拦，必须靠"同品种不加仓"拦住
+    trader, client, _market = _trader(max_open_positions=4)
+    client._positions = 1
+    result = trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
+    assert result.sent is False
+    assert "已有持仓" in result.message
+    assert client.orders == []
+
+
+def test_execute_fails_closed_when_position_query_fails():
+    trader, client, _market = _trader(max_open_positions=4)
+
+    def _boom(*a, **k):
+        raise OkxTradeError("timeout")
+
+    client.positions = _boom          # type: ignore[assignment]
+    result = trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
+    assert result.sent is False and "已有持仓" in result.message
 
 
 def test_execute_blocked_without_credentials():
