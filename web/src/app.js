@@ -21,6 +21,7 @@ const state = {
   bars: [],
   decision: null,       // 内层 decision
   stage1: null,
+  decisions: new Map(), // symbol -> 最近一次完整分析结果（用于快速切换时即时展示）
   watch: new Map(),     // symbol -> {price, order, dir, conf, ts, status, closedTs}
   busy: false,
 };
@@ -305,6 +306,7 @@ async function runAnalysis(symbol, timeframe, bars, { silent = false } = {}) {
 function renderDecision(out) {
   const stage2 = out.stage2 || {};
   const d = stage2.decision || {};
+  if (out.symbol) state.decisions.set(out.symbol, out);
   state.decision = d;
   state.stage1 = out.stage1 || {};
   $("decision-empty").classList.toggle("hidden", true);
@@ -321,6 +323,86 @@ function renderDecision(out) {
   const executable = ORDER_TYPES.includes(String(d.order_type || "").trim());
   $("btn-trade").disabled = !executable;
   $("d-plan").textContent = executable ? "点「执行下单」计算" : "当前无可执行方案";
+  renderQuickSymbols();
+}
+
+function resetDecisionPanel() {
+  state.decision = null;
+  state.stage1 = null;
+  $("decision-empty").classList.remove("hidden");
+  $("decision-body").classList.add("hidden");
+  $("btn-trade").disabled = true;
+  clearDecisionLines();
+}
+
+/* 顶部快捷品种：来自监控列表，点一下切换；圆点表示最近一次分析的方案方向。 */
+function renderQuickSymbols() {
+  const box = $("quick-symbols");
+  if (!box) return;
+  const current = currentSymbol();
+  const symbols = [...state.settings.watch];
+  if (current && !symbols.includes(current)) symbols.push(current);
+  box.innerHTML = "";
+  if (!symbols.length) {
+    const hint = el("span", "muted small", "（点「＋监控」把当前品种加进来）");
+    box.append(hint);
+    return;
+  }
+  for (const sym of symbols) {
+    const row = state.watch.get(sym) || {};
+    const out = state.decisions.get(sym);
+    const d = out?.stage2?.decision || {};
+    let dotCls = "";
+    if (d.order_type && ORDER_TYPES.includes(String(d.order_type).trim())) {
+      dotCls = d.order_direction === "做多" ? "long" : d.order_direction === "做空" ? "short" : "none";
+    } else if (d.order_type) {
+      dotCls = "none";
+    }
+    const chip = el("span", "chip" + (sym === current ? " active" : ""));
+    const dot = el("span", "dot " + dotCls);
+    const conf = d.trade_confidence != null ? ` ${Math.round(d.trade_confidence)}` : "";
+    chip.append(dot, document.createTextNode(sym.replace(/-USDT-SWAP$/, "").replace(/-USDT$/, "")));
+    if (conf) chip.append(el("span", "conf", conf));
+    chip.title = `${sym}${row.price ? ` · 最新价 ${fmtPrice(row.price)}` : ""}` +
+      (d.order_type ? ` · 最近决策 ${d.order_type}${d.order_direction ? " " + d.order_direction : ""}` : " · 暂无分析");
+    chip.onclick = () => switchToSymbol(sym);
+    box.append(chip);
+  }
+}
+
+/* 切品种：先把缓存的结果立刻显示出来，再拉最新 K 线（不自动烧 token）。 */
+async function switchToSymbol(symbol, { analyze = false } = {}) {
+  if (!symbol || state.busy) return;
+  $("symbol").value = symbol;
+  const cached = state.decisions.get(symbol);
+  if (cached) renderDecision(cached);
+  else resetDecisionPanel();
+  renderQuickSymbols();
+  if (analyze) return onAnalyze();
+  try {
+    setStatus(`正在加载 ${symbol} …`);
+    const bars = await fetchCandles(symbol, currentTimeframe(), state.settings.general.barCount + WARMUP + 5);
+    state.bars = bars;
+    renderChart(bars);
+    if (cached) drawDecisionLines(cached.stage2?.decision);
+    const what = cached?.stage2?.decision?.order_type || "尚无分析";
+    setStatus(cached ? `${symbol} 已切换（显示上次分析结果：${what}）` : `${symbol} 已切换（还没分析过，点「提交分析」）`);
+  } catch (err) {
+    setStatus(`取数失败：${err.message}`, true);
+  }
+}
+
+function toggleWatchCurrent() {
+  const sym = currentSymbol();
+  if (!sym) return;
+  const list = state.settings.watch;
+  const idx = list.indexOf(sym);
+  if (idx >= 0) list.splice(idx, 1);
+  else { list.push(sym); state.watch.set(sym, state.watch.get(sym) || { status: "等待" }); }
+  saveSettings();
+  renderQuickSymbols();
+  renderWatch();
+  setStatus(idx >= 0 ? `已把 ${sym} 移出监控列表` : `已把 ${sym} 加入监控列表`);
 }
 
 async function onAnalyze() {
@@ -442,8 +524,7 @@ function renderWatch() {
       el("td", null, row.ts ? new Date(row.ts).toLocaleTimeString("zh-CN", { hour12: false }) : "—"),
     );
     tr.onclick = () => {
-      $("symbol").value = symbol;
-      onAnalyze();
+      switchToSymbol(symbol);
     };
     tbody.append(tr);
   }
@@ -464,12 +545,14 @@ async function watchTick() {
       renderWatch();
       const out = await runAnalysis(symbol, timeframe, bars, { silent: true });
       const d = out.stage2?.decision || {};
+      state.decisions.set(symbol, { symbol, timeframe, stage1: out.stage1, stage2: out.stage2 });
       const closedNow = bars.find((b) => b.closed)?.ts ?? bars[0]?.ts;
       state.watch.set(symbol, {
         price: bars[0]?.close, order: d.order_type, dir: d.order_direction,
         conf: d.trade_confidence, ts: Date.now(), closedTs: closedNow,
       });
       renderWatch();
+      renderQuickSymbols();
       if (ORDER_TYPES.includes(String(d.order_type || "").trim())) {
         setStatus(`📣 ${symbol} ${d.order_direction} ${d.order_type}（置信度 ${Math.round(d.trade_confidence ?? 0)}）`);
       }
@@ -571,6 +654,7 @@ function main() {
   renderWatch();
   for (const s of state.settings.watch) state.watch.set(s, state.watch.get(s) || { status: "等待" });
   renderWatch();
+  renderQuickSymbols();
 
   $("btn-fetch").onclick = async () => {
     try {
@@ -584,6 +668,9 @@ function main() {
   };
   $("btn-analyze").onclick = onAnalyze;
   $("btn-trade").onclick = onTrade;
+  $("btn-star").onclick = toggleWatchCurrent;
+  $("symbol").addEventListener("change", renderQuickSymbols);
+  $("timeframe").addEventListener("change", renderQuickSymbols);
 
   state.engine = new Engine();
   $("btn-analyze").disabled = true;          // 引擎就绪前先禁用，避免点了没反应

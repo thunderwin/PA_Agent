@@ -25,9 +25,14 @@
   <button id="btn-fetch" class="primary">获取数据</button>
   <button id="btn-analyze">提交分析</button>
   <button id="btn-trade" disabled>执行下单</button>
+  <button id="btn-star" title="把当前品种加入/移出多品种监控列表">＋监控</button>
   <span id="status" class="muted">就绪</span>
   <span class="spacer"></span>
   <span id="engine-badge" class="badge">引擎加载中…</span>
+  <div id="quick-bar" class="chips">
+    <span class="muted small">快捷品种：</span>
+    <span id="quick-symbols" class="chips"></span>
+  </div>
 </header>
 
 <main>
@@ -64,7 +69,7 @@
         <thead><tr><th>品种</th><th>最新价</th><th>决策</th><th>方向</th><th>置信度</th><th>时间</th></tr></thead>
         <tbody></tbody>
       </table>
-      <div class="muted pad">双击某一行把主图表切到该品种。</div>
+      <div class="muted pad">点任意一行即可把主图表切到该品种（顶部「快捷品种」也是同一份列表）。</div>
     </div>
 
     <div id="tab-stream" class="tab hidden">

@@ -38,6 +38,20 @@ button.danger { color: var(--short); }
 button:disabled { opacity: .45; cursor: not-allowed; }
 .badge { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
 .badge.ok { color: var(--long); border-color: #1f6f35; }
+.chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+#quick-bar { flex-basis: 100%; border-top: 1px dashed var(--line); padding-top: 6px; margin-top: 2px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px;
+  background: #0b1118; color: var(--muted); cursor: pointer; font-size: 12px;
+}
+.chip:hover { border-color: #3d444d; color: var(--fg); }
+.chip.active { border-color: var(--accent); color: var(--fg); background: #12233c; }
+.chip .dot { width: 6px; height: 6px; border-radius: 50%; background: #30363d; }
+.chip .dot.long { background: var(--long); }
+.chip .dot.short { background: var(--short); }
+.chip .dot.none { background: #6e7681; }
+.chip .conf { font-size: 10px; color: var(--muted); }
 
 main { flex: 1; display: flex; min-height: 0; }
 #chart { flex: 1; min-width: 0; position: relative; }
