@@ -10,8 +10,10 @@ const DEFAULTS = {
   ai: { baseUrl: "https://api.deepseek.com", model: "deepseek-chat", apiKey: "", thinking: false, effort: "high" },
   okx: { apiKey: "", secretKey: "", passphrase: "", simulated: true },
   risk: { maxLossUsd: 10, leverage: 10, minConfidence: 60 },
-  watch: [],
-  watchAuto: false,
+  auto: { enabled: false, maxOpenPositions: 4, dailyLossCapUsd: 30, liveAck: false },
+  watchTimeframe: "15m",
+  watch: ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "XAU-USDT-SWAP", "XAG-USDT-SWAP"],
+  watchAuto: true,
   general: { decisionStance: "balanced", barCount: 100, nextBar: false },
 };
 
@@ -23,6 +25,8 @@ const state = {
   stage1: null,
   decisions: new Map(), // symbol -> 最近一次完整分析结果（用于快速切换时即时展示）
   watch: new Map(),     // symbol -> {price, order, dir, conf, ts, status, closedTs}
+  autoLog: loadAutoLog(),
+  account: { equity: null, positions: null, pnlToday: null, ts: 0 },
   busy: false,
 };
 
@@ -209,6 +213,98 @@ async function okxEquityUsd() {
   if (!rows.length) return 0;
   const total = rows[0].totalEq;
   return total ? Number(total) : Number(rows[0]?.details?.[0]?.eq || 0);
+}
+
+async function okxPositions() {
+  return okxPrivate("GET", "/api/v5/account/positions", { params: { instType: "SWAP" } });
+}
+
+/* 当日（UTC+8）已实现盈亏 + 手续费，用于自动交易的日亏熔断。 */
+async function okxRealizedPnlToday() {
+  const offsetMs = 8 * 3600 * 1000;
+  const now = Date.now();
+  const dayStart = Math.floor((now + offsetMs) / 86400000) * 86400000 - offsetMs;
+  let total = 0;
+  for (const type of ["2", "3", "4"]) {
+    const rows = await okxPrivate("GET", "/api/v5/account/bills", { params: { type, limit: "100" } });
+    for (const row of rows) {
+      if (Number(row.ts || 0) < dayStart) continue;
+      total += Number(row.pnl || 0) + Number(row.fee || 0);
+    }
+  }
+  return total;
+}
+
+// ── 自动交易日志 / 面板 ───────────────────────────────────────────────────────
+function loadAutoLog() {
+  try {
+    const raw = localStorage.getItem("paAgentAutoLog");
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+function pushAutoLog(text, cls = "") {
+  state.autoLog.unshift({ t: Date.now(), text, cls });
+  state.autoLog = state.autoLog.slice(0, 200);
+  try { localStorage.setItem("paAgentAutoLog", JSON.stringify(state.autoLog)); } catch { /* ignore */ }
+  renderAutoPanel();
+}
+function notify(text) {
+  setStatus(text);
+  try {
+    if (window.Notification && Notification.permission === "granted") {
+      new Notification("PA Agent", { body: text });
+    }
+  } catch { /* ignore */ }
+}
+
+function renderAutoPanel() {
+  const s = state.settings;
+  $("auto-state").textContent = s.auto.enabled ? `开启（${s.okx.simulated ? "模拟盘" : "实盘"}）` : "关闭";
+  $("auto-state").className = s.auto.enabled ? (s.okx.simulated ? "" : "short") : "";
+  $("auto-tf").textContent = s.watchTimeframe;
+  $("auto-symbols").textContent = s.watch.length ? s.watch.join(" / ") : "（未设置）";
+  const pnl = state.account.pnlToday;
+  $("auto-pnl").textContent = pnl == null ? "—" : `${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} USDT`;
+  $("auto-pnl").className = pnl != null && pnl < 0 ? "short" : "";
+  $("auto-pos").textContent = state.account.positions == null ? "—" : String(state.account.positions);
+  $("auto-risk").textContent = `${s.risk.maxLossUsd} USDT · ${s.risk.leverage}x · 门槛 ${s.risk.minConfidence}`;
+  $("btn-auto-toggle").textContent = s.auto.enabled ? "停止自动交易" : "开始自动交易";
+  $("btn-auto-toggle").className = s.auto.enabled ? "danger" : "primary";
+
+  const box = $("auto-log");
+  box.innerHTML = "";
+  if (!state.autoLog.length) {
+    box.append(el("div", "skip", "（暂无记录）"));
+  }
+  for (const row of state.autoLog.slice(0, 80)) {
+    const div = el("div", row.cls || "");
+    div.append(el("span", "time", new Date(row.t).toLocaleString("zh-CN", { hour12: false })));
+    div.append(document.createTextNode(row.text));
+    box.append(div);
+  }
+}
+
+async function refreshAccount() {
+  if (!state.settings.okx.apiKey) return;
+  try {
+    const [equity, positions, pnl] = await Promise.all([
+      okxEquityUsd(), okxPositions(), okxRealizedPnlToday(),
+    ]);
+    state.account = {
+      equity,
+      positions: positions.filter((p) => Math.abs(Number(p.pos || 0)) > 0).length,
+      pnlToday: pnl,
+      ts: Date.now(),
+    };
+  } catch (err) {
+    pushAutoLog(`读取账户失败：${cleanMsg(err)}`, "err");
+  }
+  renderAutoPanel();
+}
+function cleanMsg(err) {
+  return String((err && err.message) || err).split("\n").pop().trim();
 }
 
 // ── 图表 ─────────────────────────────────────────────────────────────────────
@@ -440,6 +536,66 @@ async function onAnalyze() {
 }
 
 // ── 下单（浏览器内签名 + 以损定量） ───────────────────────────────────────────
+function orderBody(symbol, plan) {
+  const body = {
+    instId: symbol,
+    tdMode: symbol.split("-").length >= 3 ? "cross" : "cash",
+    side: plan.side,
+    ordType: plan.ordType,
+    sz: String(plan.size),
+  };
+  if (body.tdMode === "cross") body.posSide = "net";
+  else body.tgtCcy = "base_ccy";
+  if (plan.ordType === "limit") body.px = String(plan.price);
+  if (plan.ordType === "trigger") { body.triggerPx = String(plan.price); body.orderPx = "-1"; }
+  const algo = {};
+  if (plan.stopPx) { algo.slTriggerPx = String(plan.stopPx); algo.slOrdPx = "-1"; }
+  if (plan.takeProfitPx) { algo.tpTriggerPx = String(plan.takeProfitPx); algo.tpOrdPx = "-1"; }
+  if (Object.keys(algo).length) body.attachAlgoOrds = [algo];
+  return body;
+}
+
+async function planForSymbol(symbol, decision) {
+  const s = state.settings;
+  const [instrument, equity] = await Promise.all([fetchInstrument(symbol), okxEquityUsd()]);
+  const planOut = await state.engine.plan({
+    decision, instrument, equityUsd: equity,
+    maxLossUsd: Number(s.risk.maxLossUsd), leverage: Number(s.risk.leverage),
+    price: state.bars[0]?.close,
+  });
+  return { planOut, equity };
+}
+
+async function sendOrder(symbol, plan) {
+  const body = orderBody(symbol, plan);
+  if (body.tdMode === "cross") {
+    await okxPrivate("POST", "/api/v5/account/set-leverage", {
+      body: { instId: symbol, lever: String(plan.leverage), mgnMode: "cross" },
+    }).catch(() => {});
+  }
+  const rows = await okxPrivate("POST", "/api/v5/trade/order", { body });
+  const row = rows[0] || {};
+  if (String(row.sCode ?? "0") !== "0") throw new Error(row.sMsg || JSON.stringify(row));
+  return row;
+}
+
+function planSummary(symbol, timeframe, p, equity) {
+  return [
+    `【OKX ${state.settings.okx.simulated ? "模拟盘" : "实盘"} 下单确认】`,
+    `${symbol} ${timeframe}`,
+    `方向/类型：${p.side === "buy" ? "做多" : "做空"} · ${p.ordType === "limit" ? "限价单" : p.ordType === "trigger" ? "突破单" : "市价单"}`,
+    p.price ? `价格：${fmtPrice(p.price)}` : "",
+    `止损：${fmtPrice(p.stopPx)}（距离 ${fmtPrice(p.stopDistance)}）`,
+    p.takeProfitPx ? `止盈：${fmtPrice(p.takeProfitPx)}` : "",
+    `下单量：${p.size}（${p.baseQty} 基础币）`,
+    `名义价值：${Math.round(p.notionalUsd).toLocaleString()} USDT`,
+    `预计保证金：${Math.round(p.notionalUsd / Math.max(p.leverage, 1)).toLocaleString()} USDT（${p.leverage}x）`,
+    equity ? `账户权益：${Math.round(equity).toLocaleString()} USDT` : "",
+    "── 以损定量 ──",
+    `止损被打到：亏 ${p.riskUsd.toFixed(2)} USDT`,
+  ].filter(Boolean).join("\n");
+}
+
 async function onTrade() {
   const d = state.decision;
   if (!d) return;
@@ -453,59 +609,92 @@ async function onTrade() {
   }
   try {
     setStatus("正在计算下单量…");
-    const [instrument, equity] = await Promise.all([fetchInstrument(symbol), okxEquityUsd()]);
-    const planOut = await state.engine.plan({
-      decision: d, instrument, equityUsd: equity,
-      maxLossUsd: Number(s.risk.maxLossUsd), leverage: Number(s.risk.leverage),
-      price: state.bars[0]?.close,
-    });
-    if (!planOut.ok) { setStatus(`无法下单：${planOut.error}`, true); alert(`无法下单：\n${planOut.error}`); return; }
+    const { planOut, equity } = await planForSymbol(symbol, d);
+    if (!planOut.ok) {
+      setStatus(`无法下单：${planOut.error}`, true);
+      alert(`无法下单：\n${planOut.error}`);
+      return;
+    }
     const p = planOut.plan;
     $("d-plan").textContent = `${p.size} 张 · 止损亏 ${p.riskUsd.toFixed(2)} USDT`;
-    const mode = s.okx.simulated ? "模拟盘" : "实盘";
-    const msg = [
-      `【OKX ${mode} 下单确认】`,
-      `${symbol} ${currentTimeframe()}`,
-      `方向/类型：${p.side === "buy" ? "做多" : "做空"} · ${p.ordType === "limit" ? "限价单" : p.ordType === "trigger" ? "突破单" : "市价单"}`,
-      p.price ? `价格：${fmtPrice(p.price)}` : "",
-      `止损：${fmtPrice(p.stopPx)}（距离 ${fmtPrice(p.stopDistance)}）`,
-      p.takeProfitPx ? `止盈：${fmtPrice(p.takeProfitPx)}` : "",
-      `下单量：${p.size}（${p.baseQty} 基础币）`,
-      `名义价值：${Math.round(p.notionalUsd).toLocaleString()} USDT`,
-      `预计保证金：${Math.round(p.notionalUsd / Math.max(p.leverage, 1)).toLocaleString()} USDT（${p.leverage}x）`,
-      `账户权益：${Math.round(equity).toLocaleString()} USDT`,
-      "── 以损定量 ──",
-      `止损被打到：亏 ${p.riskUsd.toFixed(2)} USDT`,
-    ].filter(Boolean).join("\n");
-    if (!confirm(msg + "\n\n确认下单吗？")) { setStatus("已取消下单"); return; }
-    if (!s.okx.simulated && !confirm("⚠️ 这是实盘：真实资金，确认后不可撤销。继续吗？")) { setStatus("已取消下单"); return; }
-
-    const body = {
-      instId: symbol, tdMode: symbol.split("-").length >= 3 ? "cross" : "cash",
-      side: p.side, ordType: p.ordType, sz: String(p.size),
-    };
-    if (body.tdMode === "cross") body.posSide = "net";
-    else body.tgtCcy = "base_ccy";
-    if (p.ordType === "limit") body.px = String(p.price);
-    if (p.ordType === "trigger") { body.triggerPx = String(p.price); body.orderPx = "-1"; }
-    const algo = {};
-    if (p.stopPx) { algo.slTriggerPx = String(p.stopPx); algo.slOrdPx = "-1"; }
-    if (p.takeProfitPx) { algo.tpTriggerPx = String(p.takeProfitPx); algo.tpOrdPx = "-1"; }
-    if (Object.keys(algo).length) body.attachAlgoOrds = [algo];
-
-    if (body.tdMode === "cross") {
-      await okxPrivate("POST", "/api/v5/account/set-leverage", {
-        body: { instId: symbol, lever: String(p.leverage), mgnMode: "cross" },
-      }).catch(() => {});
+    if (!confirm(planSummary(symbol, currentTimeframe(), p, equity) + "\n\n确认下单吗？")) {
+      setStatus("已取消下单");
+      return;
     }
-    const rows = await okxPrivate("POST", "/api/v5/trade/order", { body });
-    const row = rows[0] || {};
-    if (String(row.sCode ?? "0") !== "0") throw new Error(row.sMsg || JSON.stringify(row));
+    if (!s.okx.simulated && !confirm("⚠️ 这是实盘：真实资金，确认后不可撤销。继续吗？")) {
+      setStatus("已取消下单");
+      return;
+    }
+    const row = await sendOrder(symbol, p);
     setStatus(`下单成功，订单号 ${row.ordId}`);
-    alert(`下单成功（${mode}）\n订单号：${row.ordId}`);
+    pushAutoLog(`手动下单 ${symbol} ${p.side} ${p.size} 张 · 止损亏 ${p.riskUsd.toFixed(2)} USDT · ${row.ordId}`, "ok");
+    alert(`下单成功（${s.okx.simulated ? "模拟盘" : "实盘"}）\n订单号：${row.ordId}`);
   } catch (err) {
-    setStatus(`下单失败：${err.message}`, true);
-    alert(`下单失败：\n${err.message}`);
+    setStatus(`下单失败：${cleanMsg(err)}`, true);
+    alert(`下单失败：\n${cleanMsg(err)}`);
+  }
+}
+
+/* 自动交易：K 线收盘、分析完成后的落地判断与下单（无人值守）。 */
+async function maybeAutoTrade(symbol, timeframe, out) {
+  const s = state.settings;
+  if (!s.auto.enabled) return;
+  const d = out?.stage2?.decision || {};
+  const conf = Number(d.trade_confidence ?? 0);
+  const tag = `${symbol}`;
+
+  if (!s.okx.apiKey || !s.okx.secretKey || !s.okx.passphrase) {
+    pushAutoLog(`${tag} 跳过：未配置 OKX 凭据`, "err");
+    return;
+  }
+  if (!ORDER_TYPES.includes(String(d.order_type || "").trim())) {
+    pushAutoLog(`${tag} 跳过：决策「${d.order_type || "—"}」没有可执行订单`, "skip");
+    return;
+  }
+  if (conf < Number(s.risk.minConfidence)) {
+    pushAutoLog(`${tag} 跳过：置信度 ${Math.round(conf)} < 门槛 ${s.risk.minConfidence}`, "skip");
+    return;
+  }
+
+  try {
+    await refreshAccount();
+    const positions = await okxPositions();
+    const open = positions.filter((p) => Math.abs(Number(p.pos || 0)) > 0);
+    if (open.some((p) => p.instId === symbol)) {
+      pushAutoLog(`${tag} 跳过：该品种已有持仓`, "skip");
+      return;
+    }
+    if (open.length >= Number(s.auto.maxOpenPositions)) {
+      pushAutoLog(`${tag} 跳过：持仓数 ${open.length} 已达上限 ${s.auto.maxOpenPositions}`, "skip");
+      return;
+    }
+    const pnl = state.account.pnlToday ?? 0;
+    if (pnl <= -Math.abs(Number(s.auto.dailyLossCapUsd))) {
+      pushAutoLog(`${tag} 跳过：当日已实现亏损 ${Math.abs(pnl).toFixed(2)} 已达上限，今日停止下单`, "err");
+      return;
+    }
+
+    if (!s.okx.simulated && !s.auto.liveAck) {
+      pushAutoLog(`${tag} 跳过：实盘自动下单未确认风险`, "err");
+      return;
+    }
+
+    const { planOut, equity } = await planForSymbol(symbol, d);
+    if (!planOut.ok) {
+      pushAutoLog(`${tag} 跳过：无法计算仓位（${planOut.error}）`, "err");
+      return;
+    }
+    const p = planOut.plan;
+    const row = await sendOrder(symbol, p);
+    const line = `✅ 自动下单 ${tag} ${timeframe} · ${p.side === "buy" ? "做多" : "做空"} ${p.size} 张 @ ${fmtPrice(p.price)}` +
+      ` · 止损 ${fmtPrice(p.stopPx)}（亏 ${p.riskUsd.toFixed(2)} USDT） · 名义 ${Math.round(p.notionalUsd)} · 权益 ${Math.round(equity)} · ${row.ordId}`;
+    pushAutoLog(line, "ok");
+    notify(`已自动下单 ${symbol}（止损亏 ${p.riskUsd.toFixed(2)} USDT）`);
+    state.watch.set(symbol, { ...(state.watch.get(symbol) || {}), status: `已下单 ${p.size} 张` });
+    renderWatch();
+  } catch (err) {
+    pushAutoLog(`${tag} 自动下单失败：${cleanMsg(err)}`, "err");
+    notify(`自动下单失败：${cleanMsg(err)}`);
   }
 }
 
@@ -534,7 +723,7 @@ async function watchTick() {
   for (const symbol of state.settings.watch) {
     if (state.busy) return;
     try {
-      const timeframe = currentTimeframe();
+      const timeframe = state.settings.watchTimeframe || "15m";
       const bars = await fetchCandles(symbol, timeframe, state.settings.general.barCount + WARMUP + 5);
       const closedTs = bars.find((b) => b.closed)?.ts ?? bars[0]?.ts;
       const prev = state.watch.get(symbol) || {};
@@ -556,6 +745,7 @@ async function watchTick() {
       if (ORDER_TYPES.includes(String(d.order_type || "").trim())) {
         setStatus(`📣 ${symbol} ${d.order_direction} ${d.order_type}（置信度 ${Math.round(d.trade_confidence ?? 0)}）`);
       }
+      await maybeAutoTrade(symbol, timeframe, out);
     } catch (err) {
       state.watch.set(symbol, { ...(state.watch.get(symbol) || {}), status: `失败：${err.message}` });
       renderWatch();
@@ -593,6 +783,11 @@ function loadSettingsIntoForm() {
   $("s-okx-key").value = s.okx.apiKey; $("s-okx-secret").value = s.okx.secretKey; $("s-okx-pass").value = s.okx.passphrase;
   $("s-okx-sim").checked = !!s.okx.simulated;
   $("s-maxloss").value = s.risk.maxLossUsd; $("s-leverage").value = s.risk.leverage; $("s-minconf").value = s.risk.minConfidence;
+  $("s-auto").checked = !!s.auto.enabled;
+  $("s-watch-tf").value = s.watchTimeframe || "15m";
+  $("s-maxpos").value = s.auto.maxOpenPositions;
+  $("s-dailycap").value = s.auto.dailyLossCapUsd;
+  $("s-liveack").checked = !!s.auto.liveAck;
   $("watch-auto").checked = !!s.watchAuto;
 }
 
@@ -609,8 +804,20 @@ function bindSettings() {
     s.risk.maxLossUsd = Number($("s-maxloss").value) || 10;
     s.risk.leverage = Number($("s-leverage").value) || 1;
     s.risk.minConfidence = Number($("s-minconf").value) || 0;
+    s.auto.enabled = $("s-auto").checked;
+    s.watchTimeframe = $("s-watch-tf").value || "15m";
+    s.auto.maxOpenPositions = Number($("s-maxpos").value) || 4;
+    s.auto.dailyLossCapUsd = Number($("s-dailycap").value) || 30;
+    s.auto.liveAck = $("s-liveack").checked;
     saveSettings();
-    setStatus("设置已保存到本机浏览器");
+    renderAutoPanel();
+    if (s.auto.enabled && !s.okx.simulated && !s.auto.liveAck) {
+      setStatus("⚠️ 自动下单已开但选了实盘：请在下面勾选实盘风险确认，否则不会下单", true);
+    } else if (s.auto.enabled) {
+      setStatus(`自动交易已开启（${s.okx.simulated ? "模拟盘" : "实盘"} · 周期 ${s.watchTimeframe}）`);
+    } else {
+      setStatus("设置已保存到本机浏览器");
+    }
   };
   $("btn-clear-settings").onclick = () => {
     if (!confirm("清除本机浏览器里保存的全部密钥与设置？")) return;
@@ -628,6 +835,59 @@ function bindWatch() {
     state.settings.watchAuto = e.target.checked;
     saveSettings();
     setStatus(e.target.checked ? "自动监控已开启（每分钟检查一次新 K 线）" : "自动监控已关闭");
+  };
+}
+
+function bindAutoPanel() {
+  $("btn-auto-toggle").onclick = async () => {
+    const s = state.settings;
+    if (s.auto.enabled) {
+      s.auto.enabled = false;
+      saveSettings();
+      pushAutoLog("已停止自动交易", "skip");
+      renderAutoPanel();
+      return;
+    }
+    if (!s.okx.apiKey || !s.okx.secretKey || !s.okx.passphrase) {
+      alert("请先在「设置」里填好 OKX API 凭据（API Key / Secret / Passphrase）");
+      return;
+    }
+    if (!s.watch.length) {
+      alert("监控列表为空：先在「多品种」页添加要监控的品种（如 BTC-USDT-SWAP）");
+      return;
+    }
+    if (!s.okx.simulated) {
+      if (!s.auto.liveAck) {
+        alert("实盘自动下单需要先在「设置」里勾选『我已知晓：实盘自动下单是真实资金…』");
+        return;
+      }
+      const ok = confirm(
+        `即将开启【实盘】自动下单：\n\n` +
+        `监控：${s.watch.join(" / ")}\n` +
+        `周期：${s.watchTimeframe}\n` +
+        `每笔最大亏损：${s.risk.maxLossUsd} USDT · 杠杆 ${s.risk.leverage}x · 置信度门槛 ${s.risk.minConfidence}\n` +
+        `最大持仓：${s.auto.maxOpenPositions} · 当日亏损上限：${s.auto.dailyLossCapUsd} USDT\n\n` +
+        `达到条件时会不经确认直接下单（止损止盈挂交易所）。确定开启吗？`);
+      if (!ok) return;
+    }
+    s.auto.enabled = true;
+    saveSettings();
+    try {
+      if (window.Notification && Notification.permission === "default") {
+        await Notification.requestPermission();
+      }
+    } catch { /* ignore */ }
+    pushAutoLog(
+      `已开启自动交易（${s.okx.simulated ? "模拟盘" : "实盘"} · 周期 ${s.watchTimeframe} · ` +
+      `监控 ${s.watch.join("/")}）`, "ok");
+    renderAutoPanel();
+    refreshAccount();
+  };
+  $("btn-auto-refresh").onclick = () => refreshAccount();
+  $("btn-auto-log-clear").onclick = () => {
+    state.autoLog = [];
+    try { localStorage.removeItem("paAgentAutoLog"); } catch { /* ignore */ }
+    renderAutoPanel();
   };
 }
 
@@ -649,12 +909,14 @@ function main() {
   bindTabs();
   bindSettings();
   bindWatch();
+  bindAutoPanel();
   loadSettingsIntoForm();
   loadSymbolPresets();
   renderWatch();
   for (const s of state.settings.watch) state.watch.set(s, state.watch.get(s) || { status: "等待" });
   renderWatch();
   renderQuickSymbols();
+  renderAutoPanel();
 
   $("btn-fetch").onclick = async () => {
     try {
@@ -677,6 +939,17 @@ function main() {
   state.engine.worker.postMessage({ type: "boot" });   // 页面一打开就预热引擎
   state.engine.ready.catch(() => {});
   setInterval(() => { if (state.settings.watchAuto) watchTick(); }, 60_000);
+  setInterval(() => { if (state.settings.auto.enabled) refreshAccount(); }, 300_000);
+
+  // 调试钩子：浏览器控制台可用 paAgent.state / paAgent.maybeAutoTrade(...) 排查
+  globalThis.paAgent = {
+    state,
+    maybeAutoTrade,
+    switchToSymbol,
+    renderAutoPanel,
+    refreshAccount,
+    pushAutoLog,
+  };
 }
 
 main();

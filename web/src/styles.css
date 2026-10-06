@@ -52,6 +52,15 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .chip .dot.short { background: var(--short); }
 .chip .dot.none { background: #6e7681; }
 .chip .conf { font-size: 10px; color: var(--muted); }
+.log {
+  margin-top: 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: #0b1118; max-height: 46vh; overflow: auto; font-size: 12px;
+}
+.log div { padding: 5px 8px; border-bottom: 1px solid #161b22; white-space: pre-wrap; }
+.log .ok { color: var(--long); }
+.log .skip { color: var(--muted); }
+.log .err { color: var(--short); }
+.log .time { color: #6e7681; margin-right: 6px; }
 
 main { flex: 1; display: flex; min-height: 0; }
 #chart { flex: 1; min-width: 0; position: relative; }

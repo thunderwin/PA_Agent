@@ -41,6 +41,7 @@
     <nav class="tabs">
       <button data-tab="decision" class="active">决策</button>
       <button data-tab="watch">多品种</button>
+      <button data-tab="auto">自动</button>
       <button data-tab="stream">实时</button>
       <button data-tab="settings">设置</button>
     </nav>
@@ -76,6 +77,25 @@
       <pre id="stream" class="stream"></pre>
     </div>
 
+    <div id="tab-auto" class="tab hidden">
+      <div class="kv"><span>自动下单</span><b id="auto-state">关闭</b></div>
+      <div class="kv"><span>监控周期</span><b id="auto-tf">15m</b></div>
+      <div class="kv"><span>监控品种</span><b id="auto-symbols">—</b></div>
+      <div class="kv"><span>当日已实现盈亏</span><b id="auto-pnl">—</b></div>
+      <div class="kv"><span>当前持仓数</span><b id="auto-pos">—</b></div>
+      <div class="kv"><span>每笔最大亏损 / 杠杆</span><b id="auto-risk">—</b></div>
+      <div class="row" style="margin-top:10px">
+        <button id="btn-auto-toggle" class="primary">开始自动交易</button>
+        <button id="btn-auto-refresh">刷新账户</button>
+        <button id="btn-auto-log-clear">清空日志</button>
+      </div>
+      <p class="muted small">
+        开启后：每根监控周期的 K 线收盘 → 四个品种各跑一次分析 →
+        置信度达标且有可执行方案时，直接按「以损定量」下单，止损/止盈由 OKX 托管。
+      </p>
+      <div id="auto-log" class="log"></div>
+    </div>
+
     <div id="tab-settings" class="tab hidden">
       <h3>AI 模型（用于分析）</h3>
       <label>Base URL<input id="s-base" placeholder="https://api.deepseek.com" /></label>
@@ -90,6 +110,17 @@
       <label>每笔最大亏损（USDT）<input id="s-maxloss" type="number" min="0.5" step="0.5" value="10" /></label>
       <label>杠杆<input id="s-leverage" type="number" min="1" max="50" value="10" /></label>
       <label>最低置信度<input id="s-minconf" type="number" min="0" max="100" value="60" /></label>
+      <h3>自动交易（无人值守）</h3>
+      <label class="chk"><input type="checkbox" id="s-auto" /> 自动下单（K 线收盘达阈值即下单）</label>
+      <label>监控周期
+        <select id="s-watch-tf">
+          <option>1m</option><option>5m</option><option selected>15m</option>
+          <option>30m</option><option>1h</option><option>4h</option>
+        </select>
+      </label>
+      <label>最大同时持仓<input id="s-maxpos" type="number" min="1" max="10" value="4" /></label>
+      <label>当日亏损上限（USDT）<input id="s-dailycap" type="number" min="1" step="5" value="30" /></label>
+      <label class="chk"><input type="checkbox" id="s-liveack" /> 我已知晓：实盘自动下单是真实资金，无人值守也可能亏损</label>
       <div class="row">
         <button id="btn-save-settings" class="primary">保存到本机浏览器</button>
         <button id="btn-clear-settings" class="danger">清除全部密钥</button>
