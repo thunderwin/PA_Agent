@@ -251,6 +251,82 @@ class _AnalysisWorker(QThread):
 
 # ── MainWindow ────────────────────────────────────────────────────────────────
 
+#: 支持多品种后台监控的数据源（REST 型，能安全地再建一个实例）
+_WATCHLIST_KINDS: frozenset[str] = frozenset(
+    {"okx", "eastmoney", "eastmoney_futures", "yfinance", "akshare", "tushare"}
+)
+
+
+class _WatchlistWorker(QThread):
+    """多品种监控线程：轮流给每个品种取数，新 K 线收盘才跑分析。"""
+
+    result_ready = pyqtSignal(object)   # WatchResult
+    status_update = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        targets: list[tuple[str, str]],
+        bar_count: int,
+        interval_s: int,
+        make_orchestrator: Any,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._kind = kind
+        self._targets = list(targets)
+        self._bar_count = int(bar_count)
+        self._interval_s = max(int(interval_s), 10)
+        self._make_orchestrator = make_orchestrator
+
+        from pa_agent.util.threading import CancelToken
+
+        self._cancel_token = CancelToken()
+
+    def stop(self) -> None:
+        self._cancel_token.set()
+
+    def run(self) -> None:  # noqa: C901
+        import time as _time
+
+        from pa_agent.data.factory import create_data_source
+        from pa_agent.orchestrator.watchlist import WatchTarget, run_watchlist
+
+        try:
+            source = create_data_source(self._kind)
+            source.connect()
+        except Exception as exc:  # noqa: BLE001
+            self.status_update.emit(f"多品种监控无法启动：{exc}")
+            return
+
+        targets = [WatchTarget(symbol, timeframe) for symbol, timeframe in self._targets]
+        previous: dict[tuple[str, str], int] = {}
+        try:
+            while not self._cancel_token.is_set():
+                self.status_update.emit(
+                    f"多品种监控：正在检查 {len(targets)} 个品种…"
+                )
+                previous = run_watchlist(
+                    targets,
+                    source=source,
+                    make_orchestrator=self._make_orchestrator,
+                    bar_count=self._bar_count,
+                    cancel_token=self._cancel_token,
+                    on_result=self.result_ready.emit,
+                    previous_closed=previous,
+                )
+                waited = 0.0
+                while waited < self._interval_s and not self._cancel_token.is_set():
+                    _time.sleep(0.5)
+                    waited += 0.5
+        finally:
+            try:
+                source.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 class MainWindow(QMainWindow):
     """Top-level workbench: chart + AI sidebar (analysis / raw / decision)."""
 
@@ -304,6 +380,7 @@ class MainWindow(QMainWindow):
         # RefreshLoop runs in its own QThread
         self._refresh_loop: Any = None
         self._refresh_thread: QThread | None = None
+        self._watchlist_worker: Any = None
         # Pre-create status bar so any early callbacks don't hit AttributeError.
         # _setup_ui() will replace this with the real QStatusBar instance.
         self._status_bar: QStatusBar = QStatusBar()
@@ -337,6 +414,8 @@ class MainWindow(QMainWindow):
         self._future_trend_panel = self._ai_sidebar.future_trend
         self._decision_tree_panel = self._ai_sidebar.decision_tree
         self._decision_flow_viz_panel = self._ai_sidebar.decision_flow_viz
+        self._watchlist_panel = self._ai_sidebar.watchlist
+        self._watchlist_panel.symbol_activated.connect(self._on_watchlist_symbol_activated)
 
         # Auto demo: when flow playback ends, return to stream tab.
         try:
@@ -389,7 +468,12 @@ class MainWindow(QMainWindow):
         _okx_action.triggered.connect(self._open_okx_trading_dialog)
         menu_bar.addAction(_okx_action)
 
-        # 5. 演示模式 — 保留下拉菜单
+        # 5. 多品种监控（后台同时盯多个品种）
+        _watch_action = QAction("多品种监控", self)
+        _watch_action.triggered.connect(self._open_watchlist_dialog)
+        menu_bar.addAction(_watch_action)
+
+        # 6. 演示模式 — 保留下拉菜单
         demo_menu = menu_bar.addMenu("演示模式")
         self._demo_manual_action = QAction("手动选择记录…", self)
         self._demo_manual_action.triggered.connect(lambda: self._on_demo_menu_action("manual"))
@@ -4225,6 +4309,7 @@ class MainWindow(QMainWindow):
             self._cancel_analysis_worker()
             self._cancel_snapshot_fetch_worker()
             self._stop_refresh_loop()
+            self._stop_watchlist_worker()
         except RuntimeError as exc:
             logger.debug("Shutdown cleanup skipped: %s", exc)
         super().closeEvent(event)
@@ -4366,6 +4451,140 @@ class MainWindow(QMainWindow):
             if cb is not None and not cb.isChecked():
                 cb.setChecked(True)
                 logger.info("Auto-start: 已自动开启「持续跟踪分析」")
+
+        if bool(getattr(general, "watch_enabled", False)):
+            self._restart_watchlist_worker()
+
+    # ── 多品种监控 ────────────────────────────────────────────────────────────
+
+    def _watchlist_timeframe(self) -> str:
+        general = getattr(getattr(self._ctx, "settings", None), "general", None)
+        tf = str(getattr(general, "watch_timeframe", "") or "")
+        return tf or self._tf_combo.currentText()
+
+    def _watchlist_targets(self) -> list[Any]:
+        from pa_agent.orchestrator.watchlist import WatchTarget
+
+        general = getattr(getattr(self._ctx, "settings", None), "general", None)
+        timeframe = self._watchlist_timeframe()
+        symbols = [
+            str(s).strip().upper()
+            for s in (getattr(general, "watch_symbols", []) or [])
+            if str(s).strip()
+        ]
+        return [WatchTarget(sym, timeframe) for sym in symbols]
+
+    def _open_watchlist_dialog(self) -> None:
+        """打开「多品种监控」设置（品种列表、周期、节奏）。"""
+        from pa_agent.config.settings import Settings
+        from pa_agent.gui.watchlist_dialog import WatchlistDialog
+
+        settings: Settings = self._ctx.settings  # type: ignore[assignment]
+        if settings is None:
+            settings = Settings()
+            self._ctx.settings = settings
+
+        dlg = WatchlistDialog(settings, parent=self)
+        if dlg.exec():
+            self._restart_watchlist_worker()
+            count = len(self._watchlist_targets())
+            self._status_bar.showMessage(
+                f"多品种监控已{'启动' if getattr(settings.general, 'watch_enabled', False) else '关闭'}"
+                f"（{count} 个品种）"
+            )
+
+    def _stop_watchlist_worker(self) -> None:
+        worker = getattr(self, "_watchlist_worker", None)
+        if worker is None:
+            return
+        try:
+            worker.stop()
+            if not worker.wait(3000):
+                worker.terminate()
+                worker.wait(1000)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("停止多品种监控失败: %s", exc)
+        self._watchlist_worker = None
+
+    def _restart_watchlist_worker(self) -> None:
+        """按当前设置（重新）启动多品种监控线程。"""
+        self._stop_watchlist_worker()
+        panel = getattr(self, "_watchlist_panel", None)
+        general = getattr(getattr(self._ctx, "settings", None), "general", None)
+        if panel is None or general is None:
+            return
+        targets = self._watchlist_targets()
+        if not getattr(general, "watch_enabled", False):
+            panel.set_targets(targets)
+            panel.set_status_text("多品种监控未启用（菜单「多品种监控」里打开）")
+            return
+        if not targets:
+            panel.set_targets([])
+            panel.set_status_text("监控列表为空：菜单「多品种监控」里填入品种")
+            return
+
+        kind = self._current_data_source_kind()
+        if kind not in _WATCHLIST_KINDS:
+            panel.set_targets(targets)
+            panel.set_status_text(
+                f"当前数据源（{kind}）不支持后台多品种监控，请切到 OKX 等 REST 数据源"
+            )
+            return
+
+        panel.set_targets(targets)
+        panel.set_status_text(
+            f"监控中：{len(targets)} 个品种 · 周期 {targets[0].timeframe} · "
+            f"每 {int(getattr(general, 'watch_interval_s', 60))} 秒探活一次"
+        )
+        worker = _WatchlistWorker(
+            kind=kind,
+            targets=[(t.symbol, t.timeframe) for t in targets],
+            bar_count=int(getattr(general, "analysis_bar_count", 100) or 100),
+            interval_s=int(getattr(general, "watch_interval_s", 60) or 60),
+            make_orchestrator=self._build_orchestrator,
+            parent=None,
+        )
+        worker.result_ready.connect(self._on_watchlist_result)
+        worker.status_update.connect(self._on_status_update)
+        self._watchlist_worker = worker
+        worker.start()
+        logger.info("多品种监控已启动：%s", [t.symbol for t in targets])
+
+    def _on_watchlist_result(self, result: Any) -> None:
+        """某个品种一轮监控结束（主线程）。"""
+        panel = getattr(self, "_watchlist_panel", None)
+        if panel is not None:
+            panel.update_result(result)
+        general = getattr(getattr(self._ctx, "settings", None), "general", None)
+        alert = bool(getattr(general, "watch_alert_on_signal", True))
+        if alert and getattr(result, "ok", False) and getattr(result, "has_order", False):
+            conf = f"{result.confidence:.0f}" if result.confidence is not None else "?"
+            self._status_bar.showMessage(
+                f"📣 多品种信号：{result.symbol} {result.direction} {result.order_type}"
+                f"（置信度 {conf}）— 双击该行切换图表"
+            )
+            try:
+                from PyQt6.QtWidgets import QApplication
+
+                QApplication.beep()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_watchlist_symbol_activated(self, symbol: str, timeframe: str) -> None:
+        """双击监控表某一行 → 主图表切到该品种。"""
+        if not symbol:
+            return
+        was_running = bool(
+            getattr(self, "_refresh_loop", None) is not None
+            and self._refresh_loop.isRunning()
+        )
+        self._symbol_combo.setCurrentText(symbol)
+        if timeframe:
+            self._tf_combo.setCurrentText(timeframe)
+        self._on_symbol_or_tf_changed(symbol, timeframe or self._tf_combo.currentText())
+        if was_running:
+            self._ensure_refresh_loop_running()
+        self._status_bar.showMessage(f"已切换到 {symbol} {timeframe}")
 
     def _open_okx_trading_dialog(self) -> None:
         """打开 OKX 交易设置（凭据、实盘/模拟盘、以损定量参数）."""

@@ -98,6 +98,16 @@ class GeneralSettings(BaseModel):
     auto_start_capture: bool = False
     #: 启动程序后自动勾选「持续跟踪分析」（无人值守监控用；默认关闭）
     auto_keep_analysis: bool = False
+    #: 多品种监控：后台对 watch_symbols 里每个品种各自跑分析（不影响主图表看当前品种）
+    watch_enabled: bool = False
+    #: 被监控的品种列表（如 BTC-USDT-SWAP / ETH-USDT-SWAP）
+    watch_symbols: list[str] = Field(default_factory=list)
+    #: 监控周期；空字符串 = 跟随主窗口当前周期
+    watch_timeframe: str = ""
+    #: 探活间隔（秒）：每次检查各品种有没有新 K 线收盘（只有收盘才真正调模型）
+    watch_interval_s: int = Field(default=60, ge=10, le=3600)
+    #: 监控到可下单方案时播放提示音并提示
+    watch_alert_on_signal: bool = True
     #: 重试后取消持续跟踪分析：校验失败触发重试后自动关闭 keep_analysis
     cancel_keep_analysis_on_retry: bool = False
     #: 交易决策置信度门槛：仅当 trade_confidence >= 此值时，才视为有下单机会（弹窗警报并提供决策详情）

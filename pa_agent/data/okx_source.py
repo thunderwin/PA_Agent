@@ -101,11 +101,18 @@ _PRESET_SYMBOLS: tuple[str, ...] = (
     "DOGE-USDT-SWAP",
     "BNB-USDT-SWAP",
     "SUI-USDT-SWAP",
+    # 贵金属（走势与加密资产相关性低，适合另找交易机会）
+    "XAU-USDT-SWAP",   # 黄金
+    "XAG-USDT-SWAP",   # 白银
+    "XPT-USDT-SWAP",   # 铂金
+    "XPD-USDT-SWAP",   # 钯金
     "BTC-USDT",
     "ETH-USDT",
     "SOL-USDT",
     "XRP-USDT",
     "DOGE-USDT",
+    "PAXG-USDT",       # 代币化黄金（现货）
+    "XAUT-USDT",       # 代币化黄金（现货）
 )
 
 _USER_AGENT = (

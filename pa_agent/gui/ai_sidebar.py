@@ -12,6 +12,7 @@ from pa_agent.gui.decision_flow_viz import DecisionFlowVizPanel
 from pa_agent.gui.decision_tree_panel import DecisionTreePanel
 from pa_agent.gui.future_trend_panel import FutureTrendPanel
 from pa_agent.gui.prompt_files_panel import PromptFilesPanel
+from pa_agent.gui.watchlist_panel import WatchlistPanel
 
 if TYPE_CHECKING:
     from pa_agent.config.settings import Settings
@@ -36,8 +37,10 @@ class AISidebar(QWidget):
         self.decision_tree = DecisionTreePanel()
         self.decision_flow_viz = DecisionFlowVizPanel()
         self.future_trend = FutureTrendPanel()
+        self.watchlist = WatchlistPanel()
 
         self._tabs.addTab(self.stream, "实时")
+        self._tabs.addTab(self.watchlist, "多品种")
         self._tabs.addTab(self.decision_tree, "决策树")
         self._tabs.addTab(self.decision_flow_viz, "决策树可视化")
         self._tabs.addTab(self.decision, "决策")
