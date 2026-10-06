@@ -484,12 +484,16 @@ class _FakeClient:
         self._equity, self._positions, self._pnl = equity, positions, pnl
         self.orders: list[dict] = []
         self.leverage: list[tuple] = []
+        self.pending: list[dict] = []
 
     def equity_usd(self, ccy="USDT"):
         return self._equity
 
     def open_position_count(self, inst_type=None):
         return self._positions
+
+    def pending_orders(self, inst_id=None, inst_type="SWAP"):
+        return list(self.pending)
 
     def realized_pnl_today_usd(self, tz_offset_hours=8):
         return self._pnl
@@ -543,6 +547,27 @@ def test_execute_blocked_when_disabled():
     assert result.sent is False
     assert "开关" in result.message
     assert client.orders == [] and market.calls == 0
+
+
+def test_execute_skips_when_symbol_has_pending_order():
+    """同一品种已有未成交挂单时不再重复建仓（否则风险按笔数翻倍）。"""
+    trader, client, _market = _trader()
+    client.pending = [{"ordId": "1", "instId": "BTC-USDT-SWAP"}]
+    result = trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
+    assert result.sent is False
+    assert "未成交挂单" in result.message
+    assert client.orders == []
+
+
+def test_execute_fails_closed_when_pending_query_fails():
+    trader, client, _market = _trader()
+
+    def _boom(*a, **k):
+        raise OkxTradeError("network down")
+
+    client.pending_orders = _boom          # type: ignore[assignment]
+    result = trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
+    assert result.sent is False and "无法确认" in result.message
 
 
 def test_execute_blocked_without_credentials():

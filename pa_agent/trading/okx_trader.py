@@ -311,6 +311,18 @@ class OkxPrivateClient:
         data = self.request("GET", "/api/v5/account/positions", params=params or None)
         return list(data or [])
 
+    def pending_orders(
+        self, inst_id: str | None = None, inst_type: str | None = "SWAP"
+    ) -> list[dict[str, Any]]:
+        """未成交的挂单（限价/触发单）——用于避免同一品种重复建仓。"""
+        params: dict[str, Any] = {}
+        if inst_type:
+            params["instType"] = inst_type
+        if inst_id:
+            params["instId"] = inst_id
+        data = self.request("GET", "/api/v5/trade/orders-pending", params=params or None)
+        return list(data or [])
+
     def open_position_count(self, inst_type: str | None = None) -> int:
         rows = self.positions(inst_type=inst_type)
         return sum(1 for r in rows if abs(_as_float(r.get("pos")) or 0.0) > 0)
@@ -876,6 +888,23 @@ class OkxTrader:
                 message="；".join(guard.blocked),
             )
 
+        # 同一品种已有未成交挂单 → 跳过，避免重复建仓（风险按笔数翻倍）
+        pending = self._pending_orders_for(symbol)
+        if pending is None:
+            return ExecutionResult(
+                sent=False,
+                guard=guard,
+                dry_run=dry_run,
+                message=f"无法确认 {symbol} 的挂单状态（接口异常），按保守策略跳过",
+            )
+        if pending > 0:
+            return ExecutionResult(
+                sent=False,
+                guard=guard,
+                dry_run=dry_run,
+                message=f"{symbol} 已有 {pending} 张未成交挂单，跳过（避免重复建仓）",
+            )
+
         spec = self.spec_for(symbol)
         plan = plan_order(
             decision,
@@ -926,6 +955,14 @@ class OkxTrader:
         except Exception as exc:
             logger.warning("读取持仓失败: %s", exc)
             return 0
+
+    def _pending_orders_for(self, symbol: str) -> int | None:
+        """该品种未成交挂单数；查询失败返回 None（调用方按保守策略处理）。"""
+        try:
+            return len(self.client.pending_orders(inst_id=symbol))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询 %s 未成交挂单失败: %s", symbol, exc)
+            return None
 
     def _daily_pnl_safe(self) -> float | None:
         try:
