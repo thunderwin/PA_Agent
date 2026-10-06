@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PA Agent Web — 价格行为 AI 分析工具</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<header class="bar">
+  <div class="brand">PA Agent <span class="muted">Web</span></div>
+  <label>数据源
+    <select id="source"><option value="okx">OKX</option></select>
+  </label>
+  <label>品种
+    <input id="symbol" list="symbol-list" value="BTC-USDT-SWAP" spellcheck="false" />
+    <datalist id="symbol-list"></datalist>
+  </label>
+  <label>周期
+    <select id="timeframe">
+      <option>1m</option><option>5m</option><option selected>15m</option>
+      <option>30m</option><option>1h</option><option>4h</option><option>1d</option>
+    </select>
+  </label>
+  <button id="btn-fetch" class="primary">获取数据</button>
+  <button id="btn-analyze">提交分析</button>
+  <button id="btn-trade" disabled>执行下单</button>
+  <span id="status" class="muted">就绪</span>
+  <span class="spacer"></span>
+  <span id="engine-badge" class="badge">引擎加载中…</span>
+</header>
+
+<main>
+  <section id="chart"></section>
+  <aside>
+    <nav class="tabs">
+      <button data-tab="decision" class="active">决策</button>
+      <button data-tab="watch">多品种</button>
+      <button data-tab="stream">实时</button>
+      <button data-tab="settings">设置</button>
+    </nav>
+
+    <div id="tab-decision" class="tab">
+      <div id="decision-empty" class="muted pad">还没有分析结果：选好品种后点「提交分析」。</div>
+      <div id="decision-body" class="hidden">
+        <div class="kv"><span>决策</span><b id="d-order">—</b></div>
+        <div class="kv"><span>方向</span><b id="d-dir">—</b></div>
+        <div class="kv"><span>入场/止损/止盈</span><b id="d-prices">—</b></div>
+        <div class="kv"><span>置信度</span><b id="d-conf">—</b></div>
+        <div class="kv"><span>周期位置</span><b id="d-cycle">—</b></div>
+        <div class="kv"><span>下单量（以损定量）</span><b id="d-plan">—</b></div>
+        <details><summary>决策理由</summary><pre id="d-reason"></pre></details>
+        <details><summary>阶段一诊断</summary><pre id="d-stage1"></pre></details>
+      </div>
+    </div>
+
+    <div id="tab-watch" class="tab hidden">
+      <div class="row">
+        <input id="watch-input" placeholder="输入品种后回车添加，如 XAU-USDT-SWAP" />
+        <button id="btn-watch-add">添加</button>
+      </div>
+      <label class="chk"><input type="checkbox" id="watch-auto" /> 自动监控（按各品种自己的 K 线收盘节奏跑分析）</label>
+      <table id="watch-table">
+        <thead><tr><th>品种</th><th>最新价</th><th>决策</th><th>方向</th><th>置信度</th><th>时间</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="muted pad">双击某一行把主图表切到该品种。</div>
+    </div>
+
+    <div id="tab-stream" class="tab hidden">
+      <pre id="stream" class="stream"></pre>
+    </div>
+
+    <div id="tab-settings" class="tab hidden">
+      <h3>AI 模型（用于分析）</h3>
+      <label>Base URL<input id="s-base" placeholder="https://api.deepseek.com" /></label>
+      <label>模型<input id="s-model" placeholder="deepseek-chat" /></label>
+      <label>API Key<input id="s-key" type="password" placeholder="sk-..." /></label>
+      <h3>OKX（只用于下单，填了才有用）</h3>
+      <label>API Key<input id="s-okx-key" type="password" /></label>
+      <label>Secret Key<input id="s-okx-secret" type="password" /></label>
+      <label>Passphrase<input id="s-okx-pass" type="password" /></label>
+      <label class="chk"><input type="checkbox" id="s-okx-sim" checked /> 用 OKX 模拟盘</label>
+      <h3>风控（以损定量）</h3>
+      <label>每笔最大亏损（USDT）<input id="s-maxloss" type="number" min="0.5" step="0.5" value="10" /></label>
+      <label>杠杆<input id="s-leverage" type="number" min="1" max="50" value="10" /></label>
+      <label>最低置信度<input id="s-minconf" type="number" min="0" max="100" value="60" /></label>
+      <div class="row">
+        <button id="btn-save-settings" class="primary">保存到本机浏览器</button>
+        <button id="btn-clear-settings" class="danger">清除全部密钥</button>
+      </div>
+      <p class="muted small">
+        所有密钥只保存在你自己浏览器的 localStorage 里，直接发给 OKX / 你配置的 AI 接口，
+        不会上传到任何服务器；本页面是纯静态文件。
+      </p>
+    </div>
+  </aside>
+</main>
+
+<script src="vendor/lightweight-charts.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -91,3 +91,7 @@ docs/changelog/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# ── Web 版构建产物（dist 由 web/build.py 生成）────────────────────────────────
+web/dist/
+web/node_modules/

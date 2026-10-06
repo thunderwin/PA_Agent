@@ -1,0 +1,10 @@
+{
+  // PA Agent Web —— 纯静态站点（浏览器里跑 Python 引擎，密钥只存本机）
+  // 部署：cd web && python3 build.py && cf deploy
+  "name": "pa-agent-web",
+  "compatibility_date": "2026-10-01",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application"
+  }
+}
