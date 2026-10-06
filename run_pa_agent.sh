@@ -19,6 +19,15 @@ else
   echo "提示：未找到 ~/.okx_env，OKX 下单所需的三个环境变量将为空。"
 fi
 
+# OKX 白名单绑的是代理出口 IP：双击启动时终端可能没有代理变量，这里补上本机默认代理。
+# （在终端里启动且已有代理变量时不会覆盖）
+if [ -z "$HTTPS_PROXY" ]; then
+  export HTTP_PROXY="http://127.0.0.1:10808"
+  export HTTPS_PROXY="http://127.0.0.1:10808"
+  export ALL_PROXY="socks5h://127.0.0.1:10808"
+  export NO_PROXY="localhost,127.0.0.1,::1"
+fi
+
 echo "── OKX 交易凭据 ──────────────────────────────"
 [ -n "$OKX_API_KEY" ]     && echo "  OKX_API_KEY      : 已设置" || echo "  OKX_API_KEY      : 未设置"
 [ -n "$OKX_SECRET_KEY" ]  && echo "  OKX_SECRET_KEY   : 已设置" || echo "  OKX_SECRET_KEY   : 未设置"
