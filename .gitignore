@@ -19,11 +19,15 @@ venv/
 .env
 .env.*
 config/settings.json
+config/settings.json.bak*
 config/settings.local.json
 config/exception_state.json
 config/secret.key
 config/tv_symbol_aliases.json
 config/feishu.json
+# OKX 下单凭据（含交易权限，绝不要提交）
+config/okx_trading.json
+config/okx_trading*.bak*
 *.pem
 *.key
 

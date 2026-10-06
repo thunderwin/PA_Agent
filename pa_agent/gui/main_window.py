@@ -254,6 +254,9 @@ class _AnalysisWorker(QThread):
 class MainWindow(QMainWindow):
     """Top-level workbench: chart + AI sidebar (analysis / raw / decision)."""
 
+    #: 后台线程完成一次 OKX 下单后回到 UI 线程报告结果。
+    trade_finished = pyqtSignal(object)
+
     def __init__(self, ctx: AppContext, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(
@@ -309,6 +312,7 @@ class MainWindow(QMainWindow):
         self._connect_event_bus()
         self._update_ai_mode_label()
         self._sync_submit_button_state()
+        self.trade_finished.connect(self._on_trade_finished)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -378,7 +382,12 @@ class MainWindow(QMainWindow):
         _general_action.triggered.connect(self._open_general_settings_dialog)
         menu_bar.addAction(_general_action)
 
-        # 4. 演示模式 — 保留下拉菜单
+        # 4. OKX 交易设置（实盘/模拟盘、凭据、以损定量参数）
+        _okx_action = QAction("OKX 交易设置", self)
+        _okx_action.triggered.connect(self._open_okx_trading_dialog)
+        menu_bar.addAction(_okx_action)
+
+        # 5. 演示模式 — 保留下拉菜单
         demo_menu = menu_bar.addMenu("演示模式")
         self._demo_manual_action = QAction("手动选择记录…", self)
         self._demo_manual_action.triggered.connect(lambda: self._on_demo_menu_action("manual"))
@@ -436,7 +445,8 @@ class MainWindow(QMainWindow):
         self._data_source_combo.setMinimumWidth(108)
         self._data_source_combo.setToolTip(
             "K 线数据来源：MT5（默认，需终端登录）、"
-            "TradingView（tvDatafeed）、东方财富(A股)（HTTP 直连）"
+            "TradingView（tvDatafeed）、OKX（加密货币现货/永续，HTTP 直连）、"
+            "东方财富(A股)（HTTP 直连）"
         )
         self._data_source_combo.currentIndexChanged.connect(
             self._on_data_source_combo_changed
@@ -585,6 +595,17 @@ class MainWindow(QMainWindow):
         self._submit_btn.setMinimumWidth(100)
         self._submit_btn.clicked.connect(self._on_submit_analysis)
         ctrl_layout.addWidget(self._submit_btn)
+
+        # 执行下单：把当前决策变成 OKX 真实订单（先弹确认框，显示以损定量的每个数字）
+        self._execute_btn = QPushButton("执行下单")
+        self._execute_btn.setMinimumWidth(96)
+        self._execute_btn.setEnabled(False)
+        self._execute_btn.setToolTip(
+            "开启「OKX 交易设置 → 允许下单」且分析出可执行方案后可用；"
+            "点击后会先弹出确认框，列出止损距离与按此算出的下单量"
+        )
+        self._execute_btn.clicked.connect(lambda: self._execute_order(interactive=True))
+        ctrl_layout.addWidget(self._execute_btn)
 
         # Incremental button is kept for programmatic use but hidden from the
         # toolbar — the submit button's label changes to "增量分析" automatically
@@ -1131,6 +1152,10 @@ class MainWindow(QMainWindow):
             line.setPlaceholderText(
                 "A股 6 位 / 港股 1810 / 名称 小米集团；交易所可自动；或 XAUUSD+OANDA"
             )
+        elif kind == "okx":
+            line.setPlaceholderText(
+                "OKX 品种：BTC-USDT-SWAP（永续）/ ETH-USDT（现货）；可只填 BTC / ETH"
+            )
         elif kind == "eastmoney_futures":
             line.setPlaceholderText("选择左侧品种后在此选合约, 或直接输入如 AO2509")
         elif kind in ("akshare", "eastmoney", "tushare"):
@@ -1470,6 +1495,19 @@ class MainWindow(QMainWindow):
                 label.show()
                 return
             label.hide()
+            return
+        if kind == "okx":
+            from pa_agent.data.okx_source import normalize_okx_symbol
+
+            if normalize_okx_symbol(symbol):
+                label.hide()
+            else:
+                label.setText(
+                    "OKX 品种格式：BTC-USDT-SWAP（永续）或 ETH-USDT（现货）；"
+                    "也可直接输入简写 BTC / ETH"
+                )
+                label.setStyleSheet("color: #e6b800; font-size: 11px;")
+                label.show()
             return
         if kind != "mt5":
             label.hide()
@@ -3423,11 +3461,17 @@ class MainWindow(QMainWindow):
             self._bind_decision_tree(decision, stage1_diag or None)
             order = inner.get("order_type", "—")
             self._decision_badge.setText(f"决策: {order}")
+            # 决策就绪 → 刷新「执行下单」按钮状态（是否可下单取决于设置与方案本身）
+            self._last_decision_inner = inner
+            self._update_execute_button_state()
             if self._maybe_alert_order_opportunity(inner):
                 self._spawn_post_order_followup(inner, decision)
 
             elif getattr(self, "_demo_mode", False):
                 self._present_decision_flow_playback(force_play=True)
+
+            # 触发方式 = auto 时，按同一套风控闸门自动下单（默认 manual，不会走到这里）
+            self._maybe_auto_execute_order()
 
             # ── FlowBar: mark Stage 2 done ────────────────────────────────────
             flow = getattr(self, "_flow_bar", None)
@@ -4140,6 +4184,8 @@ class MainWindow(QMainWindow):
             self._auto_incremental_pending = False
             self._worker = None
             self._update_submit_button_state()
+            # 分析结束后（in_progress 已复位）再刷新一次「执行下单」按钮状态
+            self._update_execute_button_state()
 
             # Reap any zombie workers / refresh loops that finished while busy
             self._reap_zombie_workers()
@@ -4288,6 +4334,223 @@ class MainWindow(QMainWindow):
             self._ctx.settings = settings
             self._ai_sidebar.bind_settings(settings)
             self._apply_chart_display_settings()
+
+    # ── OKX 下单 ──────────────────────────────────────────────────────────────
+
+    def _open_okx_trading_dialog(self) -> None:
+        """打开 OKX 交易设置（凭据、实盘/模拟盘、以损定量参数）."""
+        from pa_agent.config.settings import Settings
+        from pa_agent.gui.okx_trading_dialog import OkxTradingDialog
+
+        settings: Settings = self._ctx.settings  # type: ignore[assignment]
+        if settings is None:
+            settings = Settings()
+            self._ctx.settings = settings
+
+        dlg = OkxTradingDialog(settings, parent=self)
+        if dlg.exec():
+            self._update_execute_button_state()
+            self._status_bar.showMessage(self._trading_status_text())
+
+    def _trading_settings(self) -> Any:
+        settings = getattr(self._ctx, "settings", None)
+        return getattr(settings, "trading", None)
+
+    def _trading_status_text(self) -> str:
+        from pa_agent.trading.okx_trader import OkxTrader
+
+        settings = getattr(self._ctx, "settings", None)
+        if settings is None or getattr(settings, "trading", None) is None:
+            return "交易：未配置"
+        try:
+            return OkxTrader.from_settings(settings).status_text()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("交易状态读取失败: %s", exc)
+            return "交易：状态未知"
+
+    def _reference_price_for_order(self) -> float | None:
+        """市价单估算风险用的参考价：最近一次分析快照的最新收盘价。"""
+        frame = getattr(self, "_last_analysis_frame", None)
+        bars = getattr(frame, "bars", None)
+        if bars:
+            try:
+                return float(bars[0].close)
+            except (TypeError, ValueError, AttributeError):
+                return None
+        return None
+
+    def _update_execute_button_state(self) -> None:
+        """「执行下单」按钮只有在开启下单且有可执行决策时才可用。"""
+        btn = getattr(self, "_execute_btn", None)
+        if btn is None:
+            return
+        from pa_agent.trading.okx_trader import is_executable_decision
+
+        t = self._trading_settings()
+        enabled = bool(getattr(t, "enabled", False))
+        decision = getattr(self, "_last_decision_inner", None)
+        executable = is_executable_decision(decision)
+        ok = enabled and executable and not self._analysis_in_progress
+        if getattr(self, "_ui_is_alive", lambda: True)():
+            btn.setEnabled(ok)
+        if not enabled:
+            btn.setToolTip("未开启下单：菜单「OKX 交易设置」里打开开关并填好 API 凭据")
+        elif not executable:
+            btn.setToolTip("当前决策没有可执行订单（「不下单」或缺少止损价）")
+        else:
+            cap = float(getattr(t, "max_loss_per_trade_usd", 0.0))
+            btn.setToolTip(
+                f"按当前决策下单：以损定量，每笔最多亏 {cap:.2f} USDT；点击后先弹确认框"
+            )
+
+    def _execute_order(self, *, interactive: bool) -> None:
+        """把当前决策变成 OKX 订单；interactive=True 时先弹确认框。"""
+        from pa_agent.trading.okx_trader import (
+            OkxTradeError,
+            OkxTrader,
+            TradeRejected,
+            format_plan_confirmation,
+            is_executable_decision,
+        )
+
+        settings = getattr(self._ctx, "settings", None)
+        decision = getattr(self, "_last_decision_inner", None)
+        if settings is None or not is_executable_decision(decision):
+            if interactive:
+                QMessageBox.information(
+                    self,
+                    "无可执行决策",
+                    "当前没有可下单的方案：需要 限价单 / 突破单 / 市价单，且带止损价。",
+                )
+            return
+
+        symbol = self._symbol_combo.currentText().strip()
+        timeframe = self._tf_combo.currentText()
+        price = self._reference_price_for_order()
+
+        try:
+            trader = OkxTrader.from_settings(settings)
+            preview = trader.execute(decision, symbol=symbol, dry_run=True, price=price)
+        except TradeRejected as exc:
+            if interactive:
+                QMessageBox.warning(self, "无法下单", str(exc))
+            else:
+                self._status_bar.showMessage(f"自动下单跳过：{exc}")
+            return
+        except OkxTradeError as exc:
+            if interactive:
+                QMessageBox.critical(self, "OKX 接口错误", str(exc))
+            else:
+                self._status_bar.showMessage(f"自动下单失败：{exc}")
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("下单预演失败")
+            if interactive:
+                QMessageBox.critical(self, "下单预演失败", str(exc))
+            return
+
+        if preview.plan is None:
+            if interactive:
+                QMessageBox.warning(self, "无法下单", preview.message)
+            else:
+                self._status_bar.showMessage(f"自动下单跳过：{preview.message}")
+            return
+
+        simulated = bool(getattr(trader.credentials, "simulated", True))
+        if interactive:
+            detail = format_plan_confirmation(
+                preview.plan,
+                symbol=symbol,
+                timeframe=timeframe,
+                order_type_label=str(decision.get("order_type") or ""),
+                simulated=simulated,
+            )
+            if preview.guard and preview.guard.notes:
+                detail += "\n" + "；".join(preview.guard.notes)
+            box = QMessageBox(self)
+            box.setIcon(
+                QMessageBox.Icon.Information if simulated else QMessageBox.Icon.Warning
+            )
+            box.setWindowTitle("确认下单（模拟盘）" if simulated else "确认下单（实盘）")
+            box.setText(
+                "确认按以下方案下单吗？"
+                if simulated
+                else "⚠️ 实盘下单：真实资金，确认后不可撤销"
+            )
+            box.setInformativeText(detail)
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+            )
+            box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+            ok_btn = box.button(QMessageBox.StandardButton.Ok)
+            cancel_btn = box.button(QMessageBox.StandardButton.Cancel)
+            if ok_btn is not None:
+                ok_btn.setText("确认下单")
+            if cancel_btn is not None:
+                cancel_btn.setText("取消")
+            if box.exec() != QMessageBox.StandardButton.Ok:
+                self._status_bar.showMessage("已取消下单")
+                return
+
+        self._last_trade_interactive = interactive
+        self._send_order_async(trader, decision, symbol=symbol, price=price)
+
+    def _send_order_async(self, trader: Any, decision: dict, *, symbol: str,
+                          price: float | None) -> None:
+        """下单走后台线程，避免网络往返冻结界面。"""
+        import threading
+
+        self._status_bar.showMessage("正在提交 OKX 订单…")
+        btn = getattr(self, "_execute_btn", None)
+        if btn is not None:
+            btn.setEnabled(False)
+
+        def _run() -> None:
+            try:
+                result: Any = trader.execute(
+                    decision, symbol=symbol, dry_run=False, manual_confirm=True, price=price
+                )
+            except Exception as exc:  # noqa: BLE001
+                result = exc
+            self.trade_finished.emit(result)
+
+        threading.Thread(target=_run, name="okx-order", daemon=True).start()
+
+    def _on_trade_finished(self, result: Any) -> None:
+        """下单线程结果回到 UI 线程。"""
+        from pa_agent.trading.okx_trader import ExecutionResult
+
+        interactive = bool(getattr(self, "_last_trade_interactive", True))
+        self._update_execute_button_state()
+
+        if isinstance(result, ExecutionResult):
+            if result.sent:
+                self._status_bar.showMessage(f"已下单：{result.message}｜订单号 {result.ord_id}")
+                if interactive:
+                    QMessageBox.information(
+                        self, "下单成功", f"{result.message}\n\n订单号：{result.ord_id}"
+                    )
+            else:
+                self._status_bar.showMessage(f"下单未执行：{result.message}")
+                if interactive:
+                    QMessageBox.warning(self, "下单未执行", result.message)
+            return
+
+        message = str(result)
+        self._status_bar.showMessage(f"下单失败：{message}")
+        if interactive:
+            QMessageBox.critical(self, "下单失败", message)
+
+    def _maybe_auto_execute_order(self) -> None:
+        """触发方式=auto 时：分析出可执行方案后直接下单（仍然受全部风控闸门约束）。"""
+        t = self._trading_settings()
+        if t is None or not getattr(t, "enabled", False):
+            return
+        if str(getattr(t, "trigger_mode", "manual")) != "auto":
+            return
+        if getattr(self, "_demo_mode", False) or self._analysis_in_progress:
+            return
+        self._execute_order(interactive=False)
 
     def _apply_chart_display_settings(self) -> None:
         """Sync chart label font sizes and decision-flow zoom from persisted settings."""

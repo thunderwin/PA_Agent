@@ -1,0 +1,143 @@
+# OKX（欧易）行情接入说明
+
+PA Agent 可以把 **OKX 的现货 / 永续** 直接当作 K 线数据源，用同一套两阶段 AI 分析流程
+分析 BTC、ETH 等高流动性品种。**本接入只读取公开行情，不含任何下单动作。**
+
+---
+
+## 1. 怎么用
+
+1. 启动程序（`python run.py` 或 `pa-agent`）
+2. 顶部「数据来源」下拉框选 **OKX**
+3. 品种填 `BTC-USDT-SWAP`（比特币永续）或 `ETH-USDT`（以太坊现货），周期选 15m / 1h / 4h 等
+4. 点「获取数据」开始拉 K 线，再点「提交分析」走两阶段分析
+
+OKX 用公开行情接口，**不需要 API Key**；`config/settings.json` 里只要
+`general.last_data_source = "okx"` 就会记住这个选择。
+
+---
+
+## 2. 品种写法（instId）
+
+| 输入 | 解析结果 | 说明 |
+|------|----------|------|
+| `BTC-USDT-SWAP` | 原样 | 比特币 USDT **永续**（默认品种，成交额最高） |
+| `ETH-USDT-SWAP` | 原样 | 以太坊 USDT 永续 |
+| `BTC-USDT` | 原样 | 比特币 **现货** |
+| `BTC` / `ETH` / `SOL` | `XXX-USDT-SWAP` | 裸币种默认按 USDT 永续 |
+| `BTCUSDT` | `BTC-USDT-SWAP` | 简写自动拆成 基础币-计价币 |
+| `btc/usdt` | `BTC-USDT` | 显式写出交易对 → 现货 |
+
+无法识别的输入（例如 MT5 的 `XAUUSDm`、A 股代码）会被拒绝，切换数据源时自动回落到
+`BTC-USDT-SWAP`。
+
+界面下拉框预置了 BTC / ETH / SOL / XRP / DOGE / BNB / SUI 的永续与现货；要看全市场的
+高流动性品种，可以调用 `OkxSource.fetch_liquid_symbols()`（按 24h 名义成交额排序）：
+
+```python
+from pa_agent.data.okx_source import OkxSource
+
+src = OkxSource()
+print(src.fetch_liquid_symbols(limit=20))          # 永续，USDT 计价
+print(src.fetch_liquid_symbols(inst_type="SPOT"))  # 现货
+print(src.instrument_info("BTC-USDT-SWAP"))        # tickSz / lotSz / ctVal 等合约规格
+```
+
+---
+
+## 3. 周期映射
+
+界面周期 → OKX `bar` 参数（注意 OKX 的小时/天/周/月必须大写）：
+
+| PA Agent | OKX |
+|----------|-----|
+| 1m / 3m / 5m / 15m / 30m | 1m / 3m / 5m / 15m / 30m |
+| 1h / 2h / 4h / 6h / 12h | 1H / 2H / 4H / 6H / 12H |
+| 1d / 1w / 1M | 1D / 1W / 1M |
+
+---
+
+## 4. 字段口径
+
+OKX 每行 K 线是 `[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]`，程序这样映射：
+
+| KlineBar | 来源 | 说明 |
+|----------|------|------|
+| `ts_open` | `ts` | 毫秒 UTC |
+| `volume` | 永续取 `volCcy`，现货取 `vol` | 统一为**基础币**数量（以 BTC 计） |
+| `amount` | `volCcyQuote` | **计价币**成交额（以 USDT 计） |
+| `closed` | `confirm == "1"` | `0` 表示这根还在走，用它算「等待收盘」倒计时 |
+
+---
+
+## 5. 接口与限制
+
+用到的公开接口（全部 GET，无需鉴权）：
+
+| 接口 | 用途 |
+|------|------|
+| `/api/v5/market/candles` | 最近 300 根 K 线 |
+| `/api/v5/market/history-candles` | 更早历史，分页每页 100 根 |
+| `/api/v5/public/instruments` | 合约列表与规格（10 分钟缓存） |
+| `/api/v5/market/tickers` | 24h 成交额，用于流动性排序（60 秒缓存） |
+| `/api/v5/public/time` | 交易所时间，「等待收盘」倒计时校准（30 秒缓存） |
+
+- 单次快照内部缓存 1 秒，避免高频重复请求；默认刷新间隔 1 秒即可。
+- 部分地区 `www.okx.com` 不可达，可设环境变量指向备用域名：
+  `export OKX_BASE_URL=https://aws.okx.com`
+- 品种不存在时接口返回 `code=51001`，程序提示为「拉取失败（品种/周期）」。
+
+---
+
+## 6. 真实下单（pa_agent/trading）
+
+菜单 **「OKX 交易设置」** 里配置，保存后分析页右侧控制栏会出现可用的 **「执行下单」** 按钮。
+
+### 6.1 配置
+
+1. OKX → **API 管理** → 创建 V5 API Key：权限只勾「交易」（不要提现/划转），建议绑定 IP
+2. 菜单「OKX 交易设置」填写 `API Key` / `Secret Key` / `Passphrase`，点「测试连接」确认能读到余额
+3. 选 **实盘**（需勾选风险确认）或 **模拟盘**，设置每笔最大亏损、每日亏损上限、杠杆等
+
+凭据写到 `config/okx_trading.json`（已 gitignore，权限 600）；模拟盘/实盘、风控参数写到
+`config/settings.json` 的 `trading` 段。也可以用环境变量 `OKX_API_KEY` / `OKX_SECRET_KEY` /
+`OKX_PASSPHRASE`，优先级高于文件。
+
+### 6.2 以损定量（核心）
+
+下单量不是拍脑袋定的，而是**先算止损距离，再用它反推**：
+
+```
+每单位风险 = |入场价 − 止损价|
+永续: 每张风险 = 每单位风险 × ctVal        →  张数 = 每笔最大亏损 ÷ 每张风险
+现货: 数量    = 每笔最大亏损 ÷ 每单位风险
+再向下取整到 lotSz，并受「账户权益 × 杠杆」封顶（算不够最小下单量就拒单）
+```
+
+例：BTC-USDT-SWAP 现价 85,500，止损 85,372（距离 128 USDT，ctVal=0.01）
+→ 每张风险 1.28 USDT，每笔上限 10 USDT → 7.81 张，实际止损亏损 ≈ 10.00 USDT。
+账户权益不够时（如 3 倍杠杆下只有 200 USDT）会自动把仓位压小，而不是超风险下单。
+
+止损/止盈通过 `attachAlgoOrds` **挂在 OKX 交易所侧**，程序关掉也仍然有效。
+
+### 6.3 触发方式
+
+| 模式 | 行为 |
+|------|------|
+| `manual`（默认） | 分析完成后按钮亮起；点「执行下单」先弹确认框（列出止损距离、下单量、亏损额），确认后才发单 |
+| `auto` | 新 K 线收盘、分析结束且方案可执行时自动下单（仍走全部风控闸门，不弹确认框） |
+
+### 6.4 风控闸门（任一条不满足都不下单）
+
+- 总开关未开 / 没有 API 凭据
+- 实盘但未勾选「实盘风险确认」
+- 决策不是限价单/突破单/市价单，或缺少止损价
+- 置信度 `trade_confidence` 低于设置门槛（默认 60）
+- 同时持仓数达到上限（默认 1）
+- 持仓品种不在允许列表内
+- 当日已实现亏损达到上限（默认 30 USDT）——读的是 OKX 账单，读失败时按保守策略拒单
+
+### 6.5 风险提示
+
+实盘下单是真实资金、不可撤销。本模块只保证「每笔止损亏损不超过设定值」这一件事，
+不构成投资建议，也不保证盈利。

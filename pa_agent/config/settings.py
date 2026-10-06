@@ -5,7 +5,15 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 DecisionStance = Literal["conservative", "balanced", "aggressive", "extreme_aggressive"]
-DataSourceKind = Literal["mt5", "tradingview", "akshare", "eastmoney", "eastmoney_futures", "tushare"]
+DataSourceKind = Literal[
+    "mt5",
+    "tradingview",
+    "okx",
+    "akshare",
+    "eastmoney",
+    "eastmoney_futures",
+    "tushare",
+]
 NormalizationMode = Literal["strict", "lenient"]
 
 
@@ -116,6 +124,39 @@ class GeneralSettings(BaseModel):
         return v
 
 
+class TradingSettings(BaseModel):
+    """OKX 真实下单设置（默认全关；凭据不写在这里）。
+
+    凭据只从环境变量（``OKX_API_KEY`` / ``OKX_SECRET_KEY`` / ``OKX_PASSPHRASE``）
+    或 ``credentials_path`` 指向的文件读取，避免跟着 settings.json 到处跑。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    #: 总开关。False 时任何下单请求都会被拒绝。
+    enabled: bool = False
+    #: True = OKX 模拟盘（请求头 x-simulated-trading: 1）；False = 实盘。
+    simulated: bool = True
+    #: 实盘风险确认：simulated=False 时必须为 True，否则拒绝下单（防止误切实盘）。
+    live_ack: bool = False
+    #: manual = 分析完只提示，等你点「执行下单」；auto = 新 K 线收盘后自动下单。
+    trigger_mode: Literal["manual", "auto"] = "manual"
+    #: 每笔最大亏损（USDT）。用 入场价与止损价的距离 反推下单量，超出即拒单。
+    max_loss_per_trade_usd: float = Field(default=10.0, gt=0, le=10_000)
+    #: 当日（UTC+8）累计已实现亏损上限，超过后当天不再下单。
+    daily_loss_cap_usd: float = Field(default=30.0, gt=0, le=100_000)
+    #: 同时持有的最大仓位数。
+    max_open_positions: int = Field(default=1, ge=1, le=20)
+    #: 永续杠杆（仅永续；现货忽略）。
+    leverage: int = Field(default=3, ge=1, le=50)
+    #: 低于该置信度不下单（AI 的 trade_confidence，0-100）。
+    min_confidence: int = Field(default=60, ge=0, le=100)
+    #: 允许下单的品种白名单；空列表 = 只允许当前订阅的品种。
+    allowed_symbols: list[str] = Field(default_factory=list)
+    #: 凭据文件（JSON，内含 api_key/secret_key/passphrase），务必不要提交到 Git。
+    credentials_path: str = "config/okx_trading.json"
+
+
 _FEISHU_CONFIG_KEYS = (
     "enabled",
     "webhook_url",
@@ -165,6 +206,7 @@ class Settings(BaseModel):
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
     pushplus: PushPlusSettings = Field(default_factory=PushPlusSettings)
     tushare: TushareSettings = Field(default_factory=TushareSettings)
+    trading: TradingSettings = Field(default_factory=TradingSettings)
 
 
 def provider_api_key_configured(settings: Settings | None) -> bool:

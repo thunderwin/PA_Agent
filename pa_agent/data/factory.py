@@ -9,10 +9,12 @@ from pa_agent.data.market_defaults import (
     GOLD_MT5_SYMBOL,
     GOLD_TV_SYMBOL,
 )
+from pa_agent.data.okx_source import OKX_DEFAULT_SYMBOL
 
 DataSourceKind = Literal[
     "mt5",
     "tradingview",
+    "okx",
     "akshare",
     "eastmoney",
     "eastmoney_futures",
@@ -25,6 +27,7 @@ DataSourceKind = Literal[
 DATA_SOURCE_CHOICES: tuple[tuple[DataSourceKind, str], ...] = (
     ("mt5", "MT5"),
     ("tradingview", "TradingView"),
+    ("okx", "OKX"),
 )
 
 _HIDDEN_KINDS: frozenset[DataSourceKind] = frozenset(
@@ -34,6 +37,7 @@ _HIDDEN_KINDS: frozenset[DataSourceKind] = frozenset(
 _DEFAULT_SYMBOLS: dict[DataSourceKind, str] = {
     "mt5": GOLD_MT5_SYMBOL,
     "tradingview": GOLD_TV_SYMBOL,
+    "okx": OKX_DEFAULT_SYMBOL,
     "akshare": A_SHARE_DEFAULT_SYMBOL,
     "eastmoney": A_SHARE_DEFAULT_SYMBOL,
     "eastmoney_futures": "RB0 螺纹钢",
@@ -85,6 +89,10 @@ def create_data_source(kind: str | None) -> DataSource:
         from pa_agent.data.tradingview import TradingViewSource
 
         return TradingViewSource()
+    if normalized == "okx":
+        from pa_agent.data.okx_source import OkxSource
+
+        return OkxSource()
     if normalized == "eastmoney":
         from pa_agent.data.eastmoney_source import EastMoneySource
 

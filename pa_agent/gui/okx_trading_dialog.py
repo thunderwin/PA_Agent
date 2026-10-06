@@ -1,0 +1,323 @@
+"""OKX 交易设置对话框（实盘/模拟盘、API 凭据、以损定量参数）。
+
+凭据写到 ``config/okx_trading.json``（已 gitignore，权限 600），
+其余参数写到 ``config/settings.json`` 的 ``trading`` 段。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QRadioButton,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+from pa_agent.config.paths import SETTINGS_JSON_PATH
+from pa_agent.config.settings import Settings, save_settings
+from pa_agent.trading.okx_trader import OkxCredentials, OkxPrivateClient, OkxTradeError
+
+logger = logging.getLogger(__name__)
+
+
+class OkxTradingDialog(QDialog):
+    """OKX 交易设置。保存后返回 QDialog.DialogCode.Accepted。"""
+
+    def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._settings = settings
+        self.setWindowTitle("OKX 交易设置")
+        self.setMinimumWidth(600)
+        self._setup_ui()
+        self._load_values()
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _setup_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setSpacing(12)
+
+        self._status_label = QLabel("")
+        self._status_label.setWordWrap(True)
+        root.addWidget(self._status_label)
+
+        # ── 凭据 ──────────────────────────────────────────────────────────────
+        cred_group = QGroupBox("API 凭据（OKX → API 管理 → 创建 V5 API Key，只勾「交易」权限）")
+        cred_form = QFormLayout(cred_group)
+        cred_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._api_key_edit = QLineEdit()
+        self._api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._api_key_edit.setPlaceholderText("API Key")
+        cred_form.addRow("API Key:", self._api_key_edit)
+
+        self._secret_edit = QLineEdit()
+        self._secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._secret_edit.setPlaceholderText("Secret Key")
+        cred_form.addRow("Secret Key:", self._secret_edit)
+
+        self._passphrase_edit = QLineEdit()
+        self._passphrase_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._passphrase_edit.setPlaceholderText("创建 API Key 时设置的 Passphrase")
+        cred_form.addRow("Passphrase:", self._passphrase_edit)
+
+        self._cred_path_label = QLabel("")
+        self._cred_path_label.setStyleSheet("color: #8b949e; font-size: 11px;")
+        cred_form.addRow("凭据文件:", self._cred_path_label)
+
+        test_row = QHBoxLayout()
+        self._test_btn = QPushButton("测试连接（读余额/持仓）")
+        self._test_btn.clicked.connect(self._on_test_connection)
+        test_row.addWidget(self._test_btn)
+        test_row.addStretch()
+        cred_form.addRow("", self._wrap(test_row))
+        root.addWidget(cred_group)
+
+        # ── 账户与开关 ────────────────────────────────────────────────────────
+        mode_group = QGroupBox("账户与开关")
+        mode_form = QFormLayout(mode_group)
+        mode_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._enabled_check = QCheckBox("允许下单（总开关）")
+        mode_form.addRow("", self._enabled_check)
+
+        mode_row = QHBoxLayout()
+        self._live_radio = QRadioButton("实盘（真实资金）")
+        self._demo_radio = QRadioButton("模拟盘")
+        self._live_radio.toggled.connect(self._sync_live_ack_enabled)
+        mode_row.addWidget(self._live_radio)
+        mode_row.addWidget(self._demo_radio)
+        mode_row.addStretch()
+        mode_form.addRow("账户:", self._wrap(mode_row))
+
+        self._live_ack_check = QCheckBox(
+            "我已知晓：实盘下单是真实资金，亏损不可撤销，本程序按「以损定量」计算仓位"
+        )
+        self._live_ack_check.setStyleSheet("color: #ff7b72;")
+        mode_form.addRow("", self._live_ack_check)
+
+        self._trigger_combo = QComboBox()
+        self._trigger_combo.addItem("手动确认（分析完等你点「执行下单」）", "manual")
+        self._trigger_combo.addItem("自动触发（新 K 线收盘后自动下单）", "auto")
+        mode_form.addRow("触发方式:", self._trigger_combo)
+
+        root.addWidget(mode_group)
+
+        # ── 以损定量 ──────────────────────────────────────────────────────────
+        risk_group = QGroupBox("以损定量（仓位 = 每笔最大亏损 ÷ 止损距离）")
+        risk_form = QFormLayout(risk_group)
+        risk_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._max_loss_spin = QDoubleSpinBox()
+        self._max_loss_spin.setRange(0.5, 10_000.0)
+        self._max_loss_spin.setDecimals(2)
+        self._max_loss_spin.setSuffix(" USDT")
+        risk_form.addRow("每笔最大亏损:", self._max_loss_spin)
+
+        self._daily_cap_spin = QDoubleSpinBox()
+        self._daily_cap_spin.setRange(1.0, 100_000.0)
+        self._daily_cap_spin.setDecimals(2)
+        self._daily_cap_spin.setSuffix(" USDT")
+        self._daily_cap_spin.setToolTip("当日已实现亏损达到该值后，当天不再下单")
+        risk_form.addRow("当日亏损上限:", self._daily_cap_spin)
+
+        self._max_positions_spin = QSpinBox()
+        self._max_positions_spin.setRange(1, 20)
+        risk_form.addRow("最大同时持仓:", self._max_positions_spin)
+
+        self._leverage_spin = QSpinBox()
+        self._leverage_spin.setRange(1, 50)
+        self._leverage_spin.setSuffix("x")
+        risk_form.addRow("永续杠杆:", self._leverage_spin)
+
+        self._min_conf_spin = QSpinBox()
+        self._min_conf_spin.setRange(0, 100)
+        risk_form.addRow("最低置信度:", self._min_conf_spin)
+
+        self._symbols_edit = QLineEdit()
+        self._symbols_edit.setPlaceholderText("留空 = 只允许当前订阅品种；多个用逗号分隔")
+        risk_form.addRow("允许下单品种:", self._symbols_edit)
+
+        root.addWidget(risk_group)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_save)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _wrap(self, layout) -> QWidget:
+        w = QWidget()
+        w.setLayout(layout)
+        return w
+
+    # ── 数据 ──────────────────────────────────────────────────────────────────
+
+    def _credentials_path(self) -> Path:
+        raw = getattr(self._settings.trading, "credentials_path", "config/okx_trading.json")
+        return Path(raw)
+
+    def _load_values(self) -> None:
+        t = self._settings.trading
+        self._cred_path_label.setText(str(self._credentials_path()))
+        cred = OkxCredentials.load(self._credentials_path(), simulated=bool(t.simulated))
+        if cred is not None:
+            self._api_key_edit.setText(cred.api_key)
+            self._secret_edit.setText(cred.secret_key)
+            self._passphrase_edit.setText(cred.passphrase)
+
+        self._enabled_check.setChecked(bool(t.enabled))
+        self._live_radio.setChecked(not bool(t.simulated))
+        self._demo_radio.setChecked(bool(t.simulated))
+        self._live_ack_check.setChecked(bool(t.live_ack))
+        idx = self._trigger_combo.findData(str(t.trigger_mode))
+        if idx >= 0:
+            self._trigger_combo.setCurrentIndex(idx)
+        self._max_loss_spin.setValue(float(t.max_loss_per_trade_usd))
+        self._daily_cap_spin.setValue(float(t.daily_loss_cap_usd))
+        self._max_positions_spin.setValue(int(t.max_open_positions))
+        self._leverage_spin.setValue(int(t.leverage))
+        self._min_conf_spin.setValue(int(t.min_confidence))
+        self._symbols_edit.setText(", ".join(getattr(t, "allowed_symbols", []) or []))
+        self._sync_live_ack_enabled()
+        self._refresh_status()
+
+    def _sync_live_ack_enabled(self) -> None:
+        live = self._live_radio.isChecked()
+        self._live_ack_check.setEnabled(live)
+        if not live:
+            return
+        self._live_ack_check.setToolTip("实盘必须勾选才能保存/下单")
+
+    def _refresh_status(self) -> None:
+        t = self._settings.trading
+        path = self._credentials_path()
+        cred = OkxCredentials.load(path, simulated=bool(t.simulated))
+        if not t.enabled:
+            text = "当前状态：下单开关关闭（分析照常，不会下单）"
+        elif cred is None:
+            text = "当前状态：已开启，但还没读到 API 凭据"
+        else:
+            text = f"当前状态：{'实盘' if not cred.simulated else '模拟盘'} · 凭据 {cred.mask()}"
+        self._status_label.setText(text)
+
+    def _collect_credentials(self) -> OkxCredentials:
+        return OkxCredentials(
+            self._api_key_edit.text().strip(),
+            self._secret_edit.text().strip(),
+            self._passphrase_edit.text().strip(),
+            simulated=self._demo_radio.isChecked(),
+        )
+
+    # ── 动作 ──────────────────────────────────────────────────────────────────
+
+    def _on_test_connection(self) -> None:
+        cred = self._collect_credentials()
+        if not cred.complete:
+            QMessageBox.warning(self, "缺少凭据", "请先填写 API Key / Secret Key / Passphrase。")
+            return
+        try:
+            client = OkxPrivateClient(cred, timeout=8.0)
+            equity = client.equity_usd()
+            positions = client.open_position_count()
+        except OkxTradeError as exc:
+            QMessageBox.critical(self, "连接失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "连接成功",
+            f"账户权益：{equity:,.2f} USDT\n当前持仓数：{positions}\n"
+            f"模式：{'模拟盘' if cred.simulated else '实盘'}",
+        )
+
+    def _on_save(self) -> None:
+        live = self._live_radio.isChecked()
+        if live and not self._live_ack_check.isChecked():
+            QMessageBox.warning(
+                self,
+                "需要风险确认",
+                "选择实盘必须先勾选「我已知晓：实盘下单是真实资金…」，否则无法保存。",
+            )
+            return
+
+        cred = self._collect_credentials()
+        if self._enabled_check.isChecked() and not cred.complete:
+            QMessageBox.warning(
+                self, "缺少凭据", "要开启下单，必须填写完整的 API Key / Secret Key / Passphrase。"
+            )
+            return
+        if live and not cred.simulated and cred.complete:
+            confirm = QMessageBox.question(
+                self,
+                "确认切换实盘",
+                "即将保存为【实盘】配置，程序会向 OKX 真实账户发送订单。\n\n"
+                "每笔最大亏损会严格按设置值反推仓位。确定继续吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+
+        if cred.complete and not self._write_credentials(cred):
+            return
+
+        t = self._settings.trading
+        t.enabled = self._enabled_check.isChecked()
+        t.simulated = not live
+        t.live_ack = self._live_ack_check.isChecked() if live else False
+        t.trigger_mode = str(self._trigger_combo.currentData())
+        t.max_loss_per_trade_usd = float(self._max_loss_spin.value())
+        t.daily_loss_cap_usd = float(self._daily_cap_spin.value())
+        t.max_open_positions = int(self._max_positions_spin.value())
+        t.leverage = int(self._leverage_spin.value())
+        t.min_confidence = int(self._min_conf_spin.value())
+        t.allowed_symbols = [
+            s.strip().upper() for s in self._symbols_edit.text().split(",") if s.strip()
+        ]
+        try:
+            save_settings(self._settings, SETTINGS_JSON_PATH)
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", str(exc))
+            return
+        self.accept()
+
+    def _write_credentials(self, cred: OkxCredentials) -> bool:
+        path = self._credentials_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "api_key": cred.api_key,
+                        "secret_key": cred.secret_key,
+                        "passphrase": cred.passphrase,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            QMessageBox.critical(self, "凭据写入失败", f"{path}\n{exc}")
+            return False
+        return True
