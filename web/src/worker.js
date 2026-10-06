@@ -8,8 +8,8 @@ async function boot() {
   self.postMessage({ type: "boot-progress", text: "下载 Python 运行时（首次约 10MB，会缓存）…" });
   importScripts(PYODIDE_BASE + "pyodide.js");
   const py = await loadPyodide({ indexURL: PYODIDE_BASE });
-  self.postMessage({ type: "boot-progress", text: "加载依赖（pydantic / numpy）…" });
-  await py.loadPackage(["pydantic"]);        // Pyodide 内置包，直接可用
+  self.postMessage({ type: "boot-progress", text: "加载依赖（pydantic / jsonschema）…" });
+  await py.loadPackage(["pydantic", "jsonschema"]);   // Pyodide 内置包，直接可用
 
   // 1) 引擎源码 + 策略文本
   const manifest = await (await fetch("engine/repo/manifest.json")).json();

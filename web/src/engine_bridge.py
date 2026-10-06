@@ -139,22 +139,47 @@ class BrowserLLMClient:
 # ── 记录写入 / 经验库替身 ─────────────────────────────────────────────────────
 
 class _MemoryWriter:
-    """浏览器里不落盘：把记录留在内存（供调试），接口与 PendingWriter 一致。"""
+    """浏览器里不落盘：把记录留在内存（供调试），接口与 PendingWriter 完全一致。
+
+    引擎会调用 save_full / save_partial / append_followup；其余未知方法一律吞掉，
+    避免因为桌面端新增了方法就让 Web 版崩掉。
+    """
 
     def __init__(self) -> None:
         self.saved: list[dict] = []
 
-    def save(self, record: Any, reason: str = "ok") -> None:
+    def save_full(self, record: Any) -> str:
+        self._remember(record, "ok")
+        return f"memory://{len(self.saved)}"
+
+    def save(self, record: Any, reason: str = "ok") -> str:
+        self._remember(record, reason)
+        return f"memory://{len(self.saved)}"
+
+    def save_partial(self, record: Any, reason: str) -> str:
+        self._remember(record, reason)
+        return f"memory://{len(self.saved)}"
+
+    def append_followup(self, record_id: str, turn: Any) -> None:
+        return None
+
+    def _remember(self, record: Any, reason: str) -> None:
         try:
             self.saved.append(
-                {"reason": reason, "ts": int(time.time() * 1000),
-                 "symbol": getattr(record.meta, "symbol", "")}
+                {
+                    "reason": reason,
+                    "ts": int(time.time() * 1000),
+                    "symbol": getattr(getattr(record, "meta", None), "symbol", ""),
+                }
             )
         except Exception:  # noqa: BLE001
             pass
 
-    def save_partial(self, record: Any, reason: str) -> None:
-        self.save(record, reason=reason)
+    def __getattr__(self, name: str):
+        """兜底：任何未实现的方法都当空操作，返回 None。"""
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return lambda *a, **k: None
 
 
 class _EmptyExperience:
@@ -345,7 +370,13 @@ def engine_selftest() -> str:
         info["prompt_files"] = len(files)
         info["sample"] = files[:3]
         info["routed"] = route_strategy_files(
-            {"cycle_position": "交易区间", "direction": "bullish", "gate_result": "proceed"}
+            {
+                "cycle_position": "trading_range",
+                "direction": "bullish",
+                "gate_result": "proceed",
+                "detected_patterns": [],
+                "gate_trace": [],
+            }
         )
         info["ok"] = True
     except Exception as exc:  # noqa: BLE001
