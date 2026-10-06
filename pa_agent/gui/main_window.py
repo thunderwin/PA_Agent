@@ -4569,6 +4569,45 @@ class MainWindow(QMainWindow):
                 QApplication.beep()
             except Exception:  # noqa: BLE001
                 pass
+        # 触发方式=auto 时，多品种监控出的方案直接下单（同一套闸门：以损定量/持仓/日亏…）
+        self._maybe_auto_execute_watch(result)
+
+    def _maybe_auto_execute_watch(self, result: Any) -> None:
+        trading = self._trading_settings()
+        if trading is None or not getattr(trading, "enabled", False):
+            return
+        if str(getattr(trading, "trigger_mode", "manual")) != "auto":
+            return
+        if getattr(self, "_demo_mode", False) or self._analysis_in_progress:
+            return
+        if not getattr(result, "ok", False) or not getattr(result, "has_order", False):
+            return
+        decision = getattr(result, "decision", None)
+        if not isinstance(decision, dict) or not decision:
+            return
+        symbol = str(getattr(result, "symbol", "") or "")
+        if not symbol:
+            return
+
+        import threading
+
+        self._last_trade_interactive = False
+        # 后台下单线程会读写 ctx.settings，这里只在主线程取一次引用
+        settings = self._ctx.settings
+
+        def _run() -> None:
+            from pa_agent.trading.okx_trader import OkxTrader
+
+            try:
+                trader = OkxTrader.from_settings(settings)
+                outcome: Any = trader.execute(
+                    decision, symbol=symbol, dry_run=False, manual_confirm=False
+                )
+            except Exception as exc:  # noqa: BLE001
+                outcome = exc
+            self.trade_finished.emit(outcome)
+
+        threading.Thread(target=_run, name=f"okx-auto-{symbol}", daemon=True).start()
 
     def _on_watchlist_symbol_activated(self, symbol: str, timeframe: str) -> None:
         """双击监控表某一行 → 主图表切到该品种。"""
@@ -4775,18 +4814,24 @@ class MainWindow(QMainWindow):
         if isinstance(result, ExecutionResult):
             if result.sent:
                 self._status_bar.showMessage(f"已下单：{result.message}｜订单号 {result.ord_id}")
+                if not interactive:
+                    logger.warning("自动下单成功：%s｜订单号 %s", result.message, result.ord_id)
                 if interactive:
                     QMessageBox.information(
                         self, "下单成功", f"{result.message}\n\n订单号：{result.ord_id}"
                     )
             else:
                 self._status_bar.showMessage(f"下单未执行：{result.message}")
+                if not interactive:
+                    logger.warning("自动下单未执行：%s", result.message)
                 if interactive:
                     QMessageBox.warning(self, "下单未执行", result.message)
             return
 
         message = str(result)
         self._status_bar.showMessage(f"下单失败：{message}")
+        if not interactive:
+            logger.warning("自动下单失败：%s", message)
         if interactive:
             QMessageBox.critical(self, "下单失败", message)
 

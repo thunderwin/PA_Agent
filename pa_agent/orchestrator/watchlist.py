@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field as _field
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,8 @@ class WatchResult:
     take_profit: float | None = None
     diagnosis: str = ""  # 周期位置 / 诊断摘要
     error: str = ""
+    #: 阶段二内层决策原文（自动下单要用，与主流程同一份结构）
+    decision: dict = _field(default_factory=dict)
 
     @property
     def has_order(self) -> bool:
@@ -165,6 +167,7 @@ def analyze_target(
         return result
 
     result.order_type = str(inner.get("order_type") or "")
+    result.decision = dict(inner)
     result.direction = str(inner.get("order_direction") or "")
     result.confidence = _as_float(inner.get("trade_confidence"))
     result.entry = _as_float(inner.get("entry_price"))

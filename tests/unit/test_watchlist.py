@@ -144,6 +144,9 @@ def test_analyze_target_parses_decision():
     assert result.price == 100.6  # 最新一根（含未收盘）的收盘价
     assert result.closed_ts == int(bars[1].ts_open)
     assert source.subscribed == [("BTC-USDT-SWAP", "15m")]
+    # 自动下单需要完整决策原文
+    assert result.decision["order_type"] == "限价单"
+    assert result.decision["entry_price"] == 100.5
 
 
 def test_analyze_target_skips_without_new_closed_bar():
