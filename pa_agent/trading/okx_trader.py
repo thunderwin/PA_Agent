@@ -323,6 +323,20 @@ class OkxPrivateClient:
         data = self.request("GET", "/api/v5/trade/orders-pending", params=params or None)
         return list(data or [])
 
+    def algo_pending(
+        self, inst_id: str | None = None, ord_type: str = "oco"
+    ) -> list[dict[str, Any]]:
+        """未触发的算法单。
+
+        ``attachAlgoOrds`` 附带的止损/止盈在 OKX 里是 **oco** 类型；
+        单独用 ``/trade/order-algo`` 挂的止损是 ``conditional``。
+        """
+        params: dict[str, Any] = {"instType": "SWAP", "ordType": ord_type}
+        if inst_id:
+            params["instId"] = inst_id
+        data = self.request("GET", "/api/v5/trade/orders-algo-pending", params=params)
+        return list(data or [])
+
     def open_position_count(self, inst_type: str | None = None) -> int:
         rows = self.positions(inst_type=inst_type)
         return sum(1 for r in rows if abs(_as_float(r.get("pos")) or 0.0) > 0)
@@ -941,8 +955,31 @@ class OkxTrader:
             plan=plan,
             ord_id=str(row.get("ordId", "")),
             guard=guard,
-            message=plan.summary,
+            message=plan.summary + self._stop_note(plan),
         )
+
+    def _stop_note(self, plan: OrderPlan) -> str:
+        """下单后核对止损是否真的挂上了（附带的止损在 OKX 里是 oco 单）。"""
+        try:
+            rows = self.client.algo_pending(inst_id=plan.inst_id, ord_type="oco")
+            rows += self.client.algo_pending(inst_id=plan.inst_id, ord_type="conditional")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("核对止损失败（%s）：%s", plan.inst_id, exc)
+            return "｜⚠️ 无法核对止损，请到 OKX 确认"
+        stops = [r for r in rows if str(r.get("slTriggerPx") or "").strip()]
+        if stops:
+            px = stops[0].get("slTriggerPx")
+            kind = "oco" if "tpTriggerPx" in stops[0] and stops[0].get("tpTriggerPx") else "conditional"
+            return f"｜止损已挂（{kind}，触发价 {px}）"
+        if plan.ord_type in ("market", "limit"):
+            # 市价单成交即建仓；限价单成交后才会出现 oco。这里只告警，不改动仓位。
+            logger.warning(
+                "⚠️ %s 未检测到止损单（ordId=%s）；若已成交请立即在 OKX 补挂",
+                plan.inst_id,
+                plan.summary[:40],
+            )
+            return "｜⚠️ 暂未检测到止损单（若已成交请到 OKX 确认）"
+        return ""
 
     def close_all(self, inst_id: str) -> dict[str, Any]:
         return self.client.close_position(inst_id)

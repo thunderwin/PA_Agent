@@ -485,6 +485,7 @@ class _FakeClient:
         self.orders: list[dict] = []
         self.leverage: list[tuple] = []
         self.pending: list[dict] = []
+        self.algo: list[dict] = []
 
     def equity_usd(self, ccy="USDT"):
         return self._equity
@@ -494,6 +495,9 @@ class _FakeClient:
 
     def pending_orders(self, inst_id=None, inst_type="SWAP"):
         return list(self.pending)
+
+    def algo_pending(self, inst_id=None, ord_type="oco"):
+        return list(self.algo)
 
     def realized_pnl_today_usd(self, tz_offset_hours=8):
         return self._pnl
@@ -568,6 +572,23 @@ def test_execute_fails_closed_when_pending_query_fails():
     client.pending_orders = _boom          # type: ignore[assignment]
     result = trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
     assert result.sent is False and "无法确认" in result.message
+
+
+def test_execute_reports_stop_attached():
+    """下单后应核对到止损单（OKX 里附带止损是 oco 类型）。"""
+    trader, client, _market = _trader()
+    client.algo = [{"instId": "BTC-USDT-SWAP", "slTriggerPx": "84900", "tpTriggerPx": "85200"}]
+    result = trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
+    assert result.sent is True
+    assert "止损已挂" in result.message and "84900" in result.message
+
+
+def test_execute_warns_when_no_stop_found():
+    trader, client, _market = _trader()
+    client.algo = []
+    result = trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
+    assert result.sent is True
+    assert "未检测到止损单" in result.message
 
 
 def test_execute_blocked_without_credentials():
