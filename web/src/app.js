@@ -86,16 +86,29 @@ class Engine {
     });
     this.worker.onmessage = (ev) => {
       const m = ev.data;
+      if (m.type === "boot-progress") {
+        $("engine-badge").textContent = m.text;
+        return;
+      }
       if (m.type === "ready") {
         $("engine-badge").textContent = m.info.ok
           ? `引擎就绪（策略文件 ${m.info.prompt_files} 个）`
           : `引擎异常：${m.info.error}`;
         $("engine-badge").classList.toggle("ok", !!m.info.ok);
+        $("btn-analyze").disabled = !m.info.ok;
+        if (!m.info.ok) setStatus(`引擎自检失败：${m.info.error}`, true);
         this._resolveReady(m.info);
         return;
       }
       if (m.type === "boot-error") {
-        $("engine-badge").textContent = "引擎加载失败";
+        $("engine-badge").textContent = "引擎加载失败（点此重试）";
+        $("engine-badge").style.cursor = "pointer";
+        $("engine-badge").onclick = () => {
+          $("engine-badge").textContent = "引擎加载中…";
+          $("btn-analyze").disabled = true;
+          this.worker.postMessage({ type: "boot" });
+        };
+        setStatus(`引擎加载失败：${m.message}`, true);
         this._rejectReady(new Error(m.message));
         return;
       }
@@ -276,7 +289,10 @@ function analysisPayload(bars, symbol, timeframe, price) {
 async function runAnalysis(symbol, timeframe, bars, { silent = false } = {}) {
   const stream = $("stream");
   const onProgress = (stage, text) => {
-    if (stage === "event") { if (!silent) setStatus(`分析中…（${text}）`); return; }
+    if (stage === "event") {
+      stream.textContent += `\n[阶段] ${text}\n`;
+      return;
+    }
     if (stage === "stage2_files") { stream.textContent += `\n[策略文件] ${text}\n`; return; }
     if (stage.endsWith("reasoning") || stage.endsWith("content")) {
       stream.textContent += `\n[${stage}]\n${text}\n`;
@@ -314,6 +330,8 @@ async function onAnalyze() {
   if (!symbol) return;
   state.busy = true;
   $("btn-analyze").disabled = true;
+  const started = Date.now();
+  let timer = null;
   setStatus("正在取 K 线…");
   try {
     const need = state.settings.general.barCount + WARMUP + 5;
@@ -321,13 +339,19 @@ async function onAnalyze() {
     state.bars = bars;
     renderChart(bars);
     setStatus("分析中（引擎已在浏览器内运行）…");
+    timer = setInterval(() => {
+      const sec = Math.round((Date.now() - started) / 1000);
+      setStatus(`分析中…已用 ${sec} 秒（两阶段模型推理通常 30–120 秒）`);
+    }, 1000);
     const out = await runAnalysis(symbol, timeframe, bars);
     if (out.exception) throw new Error(`${out.exception.type}: ${out.exception.message || ""}`);
     renderDecision(out);
-    setStatus(`分析完成：${out.stage2?.decision?.order_type || "—"}`);
+    const used = Math.round((Date.now() - started) / 1000);
+    setStatus(`分析完成（${used} 秒）：${out.stage2?.decision?.order_type || "—"}`);
   } catch (err) {
     setStatus(`分析失败：${err.message}`, true);
   } finally {
+    if (timer) clearInterval(timer);
     state.busy = false;
     $("btn-analyze").disabled = false;
   }
@@ -562,6 +586,8 @@ function main() {
   $("btn-trade").onclick = onTrade;
 
   state.engine = new Engine();
+  $("btn-analyze").disabled = true;          // 引擎就绪前先禁用，避免点了没反应
+  state.engine.worker.postMessage({ type: "boot" });   // 页面一打开就预热引擎
   state.engine.ready.catch(() => {});
   setInterval(() => { if (state.settings.watchAuto) watchTick(); }, 60_000);
 }
