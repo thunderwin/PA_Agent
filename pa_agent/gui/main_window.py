@@ -313,6 +313,8 @@ class MainWindow(QMainWindow):
         self._update_ai_mode_label()
         self._sync_submit_button_state()
         self.trade_finished.connect(self._on_trade_finished)
+        # 无人值守监控：按设置自动开始拉数据 / 持续跟踪分析（默认关闭）
+        QTimer.singleShot(1500, self._auto_start_monitoring_if_enabled)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -4336,6 +4338,34 @@ class MainWindow(QMainWindow):
             self._apply_chart_display_settings()
 
     # ── OKX 下单 ──────────────────────────────────────────────────────────────
+
+    def _auto_start_monitoring_if_enabled(self) -> None:
+        """启动后自动进入监控状态（拉数据 + 持续跟踪分析）。
+
+        只在设置里显式打开 ``general.auto_start_capture`` /
+        ``general.auto_keep_analysis`` 时才动作，方便无人值守跑分析。
+        注意：下单仍然受 trading.trigger_mode 控制，监控本身不会下单。
+        """
+        if not self._ui_is_alive() or getattr(self, "_demo_mode", False):
+            return
+        settings = getattr(self._ctx, "settings", None)
+        general = getattr(settings, "general", None)
+        if general is None:
+            return
+
+        if bool(getattr(general, "auto_start_capture", False)):
+            try:
+                self._ensure_refresh_loop_running()
+                self._status_bar.showMessage("已按设置自动开始拉取 K 线数据")
+                logger.info("Auto-start: K 线拉取已启动")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("自动开始拉取数据失败: %s", exc)
+
+        if bool(getattr(general, "auto_keep_analysis", False)):
+            cb = getattr(self, "_keep_analysis_checkbox", None)
+            if cb is not None and not cb.isChecked():
+                cb.setChecked(True)
+                logger.info("Auto-start: 已自动开启「持续跟踪分析」")
 
     def _open_okx_trading_dialog(self) -> None:
         """打开 OKX 交易设置（凭据、实盘/模拟盘、以损定量参数）."""

@@ -94,6 +94,10 @@ class GeneralSettings(BaseModel):
     auto_resume_chart_after_analysis: bool = False
     #: 持续跟踪分析：有新K线收盘时自动触发新一轮分析
     keep_analysis: bool = False
+    #: 启动程序后自动开始拉取 K 线（无人值守监控用；默认关闭）
+    auto_start_capture: bool = False
+    #: 启动程序后自动勾选「持续跟踪分析」（无人值守监控用；默认关闭）
+    auto_keep_analysis: bool = False
     #: 重试后取消持续跟踪分析：校验失败触发重试后自动关闭 keep_analysis
     cancel_keep_analysis_on_retry: bool = False
     #: 交易决策置信度门槛：仅当 trade_confidence >= 此值时，才视为有下单机会（弹窗警报并提供决策详情）
