@@ -973,11 +973,12 @@ class OkxTrader:
             plan=plan,
             ord_id=str(row.get("ordId", "")),
             guard=guard,
-            message=plan.summary + self._stop_note(plan),
+            message=plan.summary + self._stop_note(plan, str(row.get("ordId", ""))),
         )
 
-    def _stop_note(self, plan: OrderPlan) -> str:
-        """下单后核对止损是否真的挂上了（附带的止损在 OKX 里是 oco 单）。"""
+    def _stop_note(self, plan: OrderPlan, ord_id: str = "") -> str:
+        """下单后核对止损状态（附带的止损在 OKX 里是 oco；挂单成交后才生效）。"""
+        has_position = self._has_open_position_for(plan.inst_id)
         try:
             rows = self.client.algo_pending(inst_id=plan.inst_id, ord_type="oco")
             rows += self.client.algo_pending(inst_id=plan.inst_id, ord_type="conditional")
@@ -987,16 +988,36 @@ class OkxTrader:
         stops = [r for r in rows if str(r.get("slTriggerPx") or "").strip()]
         if stops:
             px = stops[0].get("slTriggerPx")
-            kind = "oco" if "tpTriggerPx" in stops[0] and stops[0].get("tpTriggerPx") else "conditional"
-            return f"｜止损已挂（{kind}，触发价 {px}）"
-        if plan.ord_type in ("market", "limit"):
-            # 市价单成交即建仓；限价单成交后才会出现 oco。这里只告警，不改动仓位。
+            return f"｜止损已挂（触发价 {px}）"
+        if has_position:
             logger.warning(
-                "⚠️ %s 未检测到止损单（ordId=%s）；若已成交请立即在 OKX 补挂",
+                "⚠️ %s 已有持仓但没有止损单，请立即到 OKX 补挂（ordId=%s）",
                 plan.inst_id,
-                plan.summary[:40],
+                ord_id,
             )
-            return "｜⚠️ 暂未检测到止损单（若已成交请到 OKX 确认）"
+            return "｜⚠️ 已有持仓但未检测到止损单，请立即到 OKX 确认"
+        attached = self._attached_stop_px(plan.inst_id, ord_id)
+        if attached:
+            return f"｜挂单未成交，止损随成交自动生效（触发价 {attached}）"
+        logger.warning("⚠️ %s 挂单未成交且订单未附带止损（ordId=%s）", plan.inst_id, ord_id)
+        return "｜⚠️ 未检测到止损，请到 OKX 确认"
+
+    def _attached_stop_px(self, inst_id: str, ord_id: str) -> str:
+        """读取订单自带的止损触发价（attachAlgoOrds）；查不到返回空串。"""
+        if not ord_id:
+            return ""
+        try:
+            rows = self.client.request(
+                "GET", "/api/v5/trade/order", params={"instId": inst_id, "ordId": ord_id}
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("读取订单 %s 附带止损失败: %s", ord_id, exc)
+            return ""
+        for row in rows or []:
+            for algo in row.get("attachAlgoOrds") or []:
+                px = str(algo.get("slTriggerPx") or "").strip()
+                if px:
+                    return px
         return ""
 
     def close_all(self, inst_id: str) -> dict[str, Any]:

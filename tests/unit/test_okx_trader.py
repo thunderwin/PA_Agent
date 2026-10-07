@@ -515,6 +515,11 @@ class _FakeClient:
     def algo_pending(self, inst_id=None, ord_type="oco"):
         return list(self.algo)
 
+    def request(self, method, path, *, params=None, body=None):
+        if path == "/api/v5/trade/order":
+            return [{"ordId": "ORD-1", "attachAlgoOrds": [{"slTriggerPx": "84900"}]}]
+        return []
+
     def positions(self, inst_id=None, inst_type=None):
         if self._positions <= 0:
             return []
@@ -604,12 +609,25 @@ def test_execute_reports_stop_attached():
     assert "止损已挂" in result.message and "84900" in result.message
 
 
-def test_execute_warns_when_no_stop_found():
+def test_execute_reports_attached_stop_for_unfilled_order():
+    """挂单还没成交时，止损随成交自动生效——不应误报"没有止损"。"""
     trader, client, _market = _trader()
     client.algo = []
     result = trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
     assert result.sent is True
-    assert "未检测到止损单" in result.message
+    assert "止损随成交自动生效" in result.message and "84900" in result.message
+
+
+def test_execute_warns_when_position_has_no_stop():
+    """已有持仓却查不到止损单 → 必须告警。"""
+    trader, client, _market = _trader()
+    client.algo = []
+    plan = type("P", (), {"inst_id": "BTC-USDT-SWAP", "ord_type": "market"})()
+
+    assert "止损随成交自动生效" in trader._stop_note(plan, "ORD-1")   # 尚未成交（无持仓）
+
+    client._positions = 1                                            # 已成交但查不到止损
+    assert "已有持仓但未检测到止损单" in trader._stop_note(plan, "ORD-1")
 
 
 def test_execute_skips_when_symbol_already_has_position():
