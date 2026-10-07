@@ -157,6 +157,8 @@ class TradingSettings(BaseModel):
     trigger_mode: Literal["manual", "auto"] = "manual"
     #: 每笔最大亏损（USDT）。用 入场价与止损价的距离 反推下单量，超出即拒单。
     max_loss_per_trade_usd: float = Field(default=10.0, gt=0, le=10_000)
+    #: 单笔名义额上限（USDT）；0 = 不限制。触顶时自动缩量——实际风险只会更小，不会更大。
+    max_notional_usd: float = Field(default=0.0, ge=0.0, le=1_000_000)
     #: 当日（UTC+8）累计已实现亏损上限，超过后当天不再下单。
     daily_loss_cap_usd: float = Field(default=30.0, gt=0, le=100_000)
     #: 同时持有的最大仓位数。

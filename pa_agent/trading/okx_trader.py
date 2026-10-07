@@ -546,10 +546,12 @@ def plan_order(
     max_loss_usd: float,
     leverage: int = 3,
     price: float | None = None,
+    max_notional_usd: float = 0.0,
 ) -> OrderPlan:
     """把阶段二决策翻译成具体订单，并保证止损亏损 ≤ ``max_loss_usd``。
 
     ``price`` 用于市价单（用最新价估算风险）；缺省时用决策里的 entry_price。
+    ``max_notional_usd`` > 0 时再按名义额上限缩量（实际风险只会更小）。
     """
     if not isinstance(decision, dict):
         raise TradeRejected("决策内容为空，无法下单")
@@ -610,13 +612,19 @@ def plan_order(
 
     lot = spec.lot_sz or (1e-8 if not spec.derivative else 1.0)
     max_sz_by_budget = _floor_to_step(max_loss_usd / risk_per_unit_effective, lot)
+    if max_notional_usd and max_notional_usd > 0:
+        max_sz_by_notional = _floor_to_step(float(max_notional_usd) / unit_notional, lot)
+        if max_sz_by_notional < max_sz_by_budget:
+            notes.append(f"按名义额上限 {max_notional_usd:,.0f} USDT 收窄仓位")
+    else:
+        max_sz_by_notional = float("inf")
 
     # 资金上限：永续按杠杆可用保证金，现货按可用资金
     multiplier = float(max(int(leverage), 1)) if spec.derivative else 1.0
     budget_equity = equity_usd * (1.0 if spec.derivative else 0.95)
     max_sz_by_equity = _floor_to_step(budget_equity * multiplier / unit_notional, lot)
 
-    size = min(max_sz_by_budget, max_sz_by_equity)
+    size = min(max_sz_by_budget, max_sz_by_notional, max_sz_by_equity)
     if max_sz_by_equity < max_sz_by_budget:
         notes.append("按账户权益收窄仓位")
 
@@ -936,6 +944,7 @@ class OkxTrader:
             max_loss_usd=float(getattr(s, "max_loss_per_trade_usd", 10.0)),
             leverage=int(getattr(s, "leverage", 3)),
             price=price,
+            max_notional_usd=float(getattr(s, "max_notional_usd", 0.0) or 0.0),
         )
         if dry_run:
             return ExecutionResult(

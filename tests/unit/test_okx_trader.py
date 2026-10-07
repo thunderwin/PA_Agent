@@ -331,6 +331,22 @@ def test_plan_order_narrows_size_by_equity():
     assert any("收窄" in n for n in plan.notes)
 
 
+def test_plan_order_clamps_by_notional_cap():
+    """名义额上限触发时缩量——实际风险只会更小，不会更大。"""
+    plan = plan_order(
+        _decision(), BTC_SWAP, equity_usd=5000, max_loss_usd=10, leverage=10,
+        max_notional_usd=1000,
+    )
+    assert plan.notional_usd <= 1000
+    assert plan.risk_usd < 10          # 缩量后风险更小
+    assert any("名义额上限" in n for n in plan.notes)
+
+
+def test_plan_order_without_notional_cap_keeps_full_risk():
+    plan = plan_order(_decision(), BTC_SWAP, equity_usd=5000, max_loss_usd=10, leverage=10)
+    assert plan.risk_usd == pytest.approx(10.0)
+
+
 def test_plan_order_spot_sizes_by_risk():
     plan = plan_order(_decision(), BTC_SPOT, equity_usd=20000, max_loss_usd=10)
     assert plan.size == pytest.approx(0.1)  # 10 USDT / 100 USDT每单位
