@@ -162,6 +162,9 @@ class TradingSettings(BaseModel):
     #: 是否把 AI 算出的止盈一并挂到交易所。
     #: False（默认）= 只挂止损，止盈由人工了结；True = 恢复"止损+止盈一起托管"。
     attach_take_profit: bool = False
+    #: 入场挂单的有效期（K 线根数）：超过这么多根仍未成交就自动撤单，0 = 不撤。
+    #: 只撤程序自己下的单（带 tag=PAAGENT），绝不碰手动挂单。
+    pending_entry_expiry_bars: int = Field(default=8, ge=0, le=200)
     #: 当日（UTC+8）累计已实现亏损上限，超过后当天不再下单。
     daily_loss_cap_usd: float = Field(default=30.0, gt=0, le=100_000)
     #: 同时持有的最大仓位数。

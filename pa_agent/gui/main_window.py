@@ -332,6 +332,8 @@ class MainWindow(QMainWindow):
 
     #: 后台线程完成一次 OKX 下单后回到 UI 线程报告结果。
     trade_finished = pyqtSignal(object)
+    #: 后台线程的其它交易事件（如撤掉过期挂单）→ 状态栏。
+    trade_note = pyqtSignal(str)
 
     def __init__(self, ctx: AppContext, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -390,6 +392,7 @@ class MainWindow(QMainWindow):
         self._update_ai_mode_label()
         self._sync_submit_button_state()
         self.trade_finished.connect(self._on_trade_finished)
+        self.trade_note.connect(self._on_status_update)
         # 无人值守监控：按设置自动开始拉数据 / 持续跟踪分析（默认关闭）
         QTimer.singleShot(1500, self._auto_start_monitoring_if_enabled)
 
@@ -4571,6 +4574,37 @@ class MainWindow(QMainWindow):
                 pass
         # 触发方式=auto 时，多品种监控出的方案直接下单（同一套闸门：以损定量/持仓/日亏…）
         self._maybe_auto_execute_watch(result)
+        # 入场挂单过期清理：超过 N 根 K 线未成交的挂单自动撤掉（只撤程序自己的单）
+        self._expire_stale_entries(str(getattr(result, "symbol", "") or ""))
+
+    def _expire_stale_entries(self, symbol: str) -> None:
+        """按 settings.trading.pending_entry_expiry_bars 撤掉过期的入场挂单。"""
+        trading = self._trading_settings()
+        if trading is None or not getattr(trading, "enabled", False) or not symbol:
+            return
+        max_bars = int(getattr(trading, "pending_entry_expiry_bars", 8) or 0)
+        if max_bars <= 0:
+            return
+        timeframe = self._watchlist_timeframe()
+        settings = self._ctx.settings
+
+        import threading
+
+        def _run() -> None:
+            from pa_agent.trading.okx_trader import OkxTrader
+
+            try:
+                trader = OkxTrader.from_settings(settings)
+                done = trader.cancel_stale_entries(symbol, timeframe, max_bars=max_bars)
+                if done:
+                    self.trade_note.emit(
+                        f"已撤掉 {symbol} 的 {len(done)} 张过期入场挂单"
+                        f"（超过 {max_bars} 根 {timeframe} K 线未成交）"
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("过期挂单清理失败（%s）：%s", symbol, exc)
+
+        threading.Thread(target=_run, name=f"okx-expire-{symbol}", daemon=True).start()
 
     def _maybe_auto_execute_watch(self, result: Any) -> None:
         trading = self._trading_settings()

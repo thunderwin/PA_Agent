@@ -55,6 +55,9 @@ _ORDER_TYPE_BREAKOUT = "突破单"
 _ORDER_TYPE_MARKET = "市价单"
 _SUPPORTED_ORDER_TYPES = (_ORDER_TYPE_LIMIT, _ORDER_TYPE_BREAKOUT, _ORDER_TYPE_MARKET)
 
+#: 程序自己下的单都带这个 tag —— 撤单/清理只认它，绝不碰用户手动挂的单。
+ORDER_TAG = "PAAGENT"
+
 
 def is_executable_decision(decision: Any) -> bool:
     """决策里是否有可执行订单（限价/突破/市价 + 方向 + 止损价）。"""
@@ -386,6 +389,7 @@ class OkxPrivateClient:
         take_profit_px: float | None = None,
         td_mode: str = "cross",
         pos_side: str | None = "net",
+        tag: str = ORDER_TAG,
     ) -> dict[str, Any]:
         """下单；``stop_px`` / ``take_profit_px`` 作为 ``attachAlgoOrds`` 托管给交易所。"""
         body: dict[str, Any] = {
@@ -395,6 +399,8 @@ class OkxPrivateClient:
             "ordType": ord_type,
             "sz": _fmt_num(size),
         }
+        if tag:
+            body["tag"] = tag          # 便于识别"程序下的单"，清理时只动这些
         if not is_derivative_symbol(inst_id):
             body["tgtCcy"] = "base_ccy"  # 现货：sz 按基础币数量
         elif pos_side:
@@ -1025,6 +1031,59 @@ class OkxTrader:
 
     def close_all(self, inst_id: str) -> dict[str, Any]:
         return self.client.close_position(inst_id)
+
+    def cancel_stale_entries(
+        self,
+        inst_id: str,
+        timeframe: str,
+        *,
+        max_bars: int,
+        now_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """撤掉过期的**入场挂单**（只动带 :data:`ORDER_TAG` 的单）。
+
+        等待回撤的限价单如果超过 ``max_bars`` 根 K 线还没成交，说明当初的
+        回撤逻辑已经过期，继续挂着等于在形态早已改变时被"自动接刀"。
+        用户手动挂的单不打我们的 tag，因此永远不会被这里撤掉。
+        """
+        if int(max_bars or 0) <= 0:
+            return []
+        from pa_agent.data.bar_close_wait import timeframe_to_seconds
+
+        bar_seconds = timeframe_to_seconds(timeframe)
+        if not bar_seconds:
+            return []
+        now = int(now_ms if now_ms is not None else time.time() * 1000)
+        max_age_ms = int(max_bars) * bar_seconds * 1000
+
+        try:
+            rows = self.client.pending_orders(inst_id=inst_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询 %s 挂单失败，跳过过期清理: %s", inst_id, exc)
+            return []
+
+        cancelled: list[dict[str, Any]] = []
+        for row in rows:
+            if str(row.get("tag") or "") != ORDER_TAG:
+                continue                      # 不是程序下的单 → 绝不碰
+            try:
+                created = int(row.get("cTime") or 0)
+            except (TypeError, ValueError):
+                continue
+            if created <= 0 or now - created < max_age_ms:
+                continue
+            try:
+                self.client.cancel_order(inst_id, str(row.get("ordId")))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("撤销过期挂单失败 %s %s: %s", inst_id, row.get("ordId"), exc)
+                continue
+            cancelled.append(row)
+            logger.warning(
+                "撤掉过期入场挂单：%s %s sz=%s 价=%s（挂了 %.0f 分钟，超过 %d 根 %s K 线）",
+                inst_id, row.get("side"), row.get("sz"), row.get("px"),
+                (now - created) / 60_000.0, max_bars, timeframe,
+            )
+        return cancelled
 
     # ── 内部 ──────────────────────────────────────────────────────────────────
 

@@ -543,6 +543,7 @@ function orderBody(symbol, plan) {
     side: plan.side,
     ordType: plan.ordType,
     sz: String(plan.size),
+    tag: "PAAGENT",   // 标记为程序下的单（与桌面版一致），清理时不误伤手动单
   };
   if (body.tdMode === "cross") body.posSide = "net";
   else body.tgtCcy = "base_ccy";

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -200,6 +201,7 @@ def test_place_order_body_includes_algo_stop_and_profit(monkeypatch):
         "sz": "10",
         "posSide": "net",
         "px": "85000",
+        "tag": "PAAGENT",           # 程序下的单都带标记，便于只清理自己的挂单
         "attachAlgoOrds": [
             {"slTriggerPx": "84900", "slOrdPx": "-1", "tpTriggerPx": "85200", "tpOrdPx": "-1"}
         ],
@@ -502,6 +504,7 @@ class _FakeClient:
         self.leverage: list[tuple] = []
         self.pending: list[dict] = []
         self.algo: list[dict] = []
+        self.cancelled: list[tuple] = []
 
     def equity_usd(self, ccy="USDT"):
         return self._equity
@@ -511,6 +514,11 @@ class _FakeClient:
 
     def pending_orders(self, inst_id=None, inst_type="SWAP"):
         return list(self.pending)
+
+    def cancel_order(self, inst_id, ord_id):
+        self.cancelled.append((inst_id, ord_id))
+        self.pending = [o for o in self.pending if str(o.get("ordId")) != str(ord_id)]
+        return {"ordId": ord_id, "sCode": "0"}
 
     def algo_pending(self, inst_id=None, ord_type="oco"):
         return list(self.algo)
@@ -577,6 +585,57 @@ def test_execute_can_still_attach_take_profit_when_enabled():
     trader, client, _market = _trader(attach_take_profit=True)
     trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
     assert client.orders[0]["take_profit_px"] == pytest.approx(85200)
+
+
+# ── 入场挂单过期清理 ──────────────────────────────────────────────────────────
+
+def _pending(tag: str, age_minutes: float, ord_id: str = "1") -> dict:
+    now_ms = int(time.time() * 1000)
+    return {
+        "ordId": ord_id, "instId": "XAU-USDT-SWAP", "side": "buy", "ordType": "limit",
+        "sz": "166", "px": "4120.6", "tag": tag,
+        "cTime": str(now_ms - int(age_minutes * 60_000)),
+    }
+
+
+def test_cancel_stale_entries_removes_old_bot_order():
+    """超过 8 根 15m（2 小时）的入场挂单会被撤掉。"""
+    trader, client, _market = _trader()
+    client.pending = [_pending("PAAGENT", age_minutes=150, ord_id="old")]
+    done = trader.cancel_stale_entries("XAU-USDT-SWAP", "15m", max_bars=8)
+    assert [d["ordId"] for d in done] == ["old"]
+    assert client.cancelled == [("XAU-USDT-SWAP", "old")]
+
+
+def test_cancel_stale_entries_keeps_fresh_order():
+    trader, client, _market = _trader()
+    client.pending = [_pending("PAAGENT", age_minutes=30, ord_id="fresh")]
+    assert trader.cancel_stale_entries("XAU-USDT-SWAP", "15m", max_bars=8) == []
+    assert client.cancelled == []
+
+
+def test_cancel_stale_entries_never_touches_manual_orders():
+    """没有我们 tag 的单（用户手动挂的）永不撤。"""
+    trader, client, _market = _trader()
+    client.pending = [_pending("", age_minutes=600, ord_id="manual"),
+                      _pending("MYTAG", age_minutes=600, ord_id="other")]
+    assert trader.cancel_stale_entries("XAU-USDT-SWAP", "15m", max_bars=8) == []
+    assert client.cancelled == []
+
+
+def test_cancel_stale_entries_disabled_when_zero():
+    trader, client, _market = _trader()
+    client.pending = [_pending("PAAGENT", age_minutes=600, ord_id="old")]
+    assert trader.cancel_stale_entries("XAU-USDT-SWAP", "15m", max_bars=0) == []
+    assert client.cancelled == []
+
+
+def test_cancel_stale_entries_unknown_timeframe_is_noop():
+    trader, client, _market = _trader()
+    client.pending = [_pending("PAAGENT", age_minutes=600, ord_id="old")]
+    # 无法换算成秒的周期（如乱填的字符串）不做任何事
+    assert trader.cancel_stale_entries("XAU-USDT-SWAP", "bogus", max_bars=8) == []
+    assert client.cancelled == []
 
 
 def test_execute_blocked_when_disabled():
