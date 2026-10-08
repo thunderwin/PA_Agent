@@ -550,7 +550,8 @@ function orderBody(symbol, plan) {
   if (plan.ordType === "trigger") { body.triggerPx = String(plan.price); body.orderPx = "-1"; }
   const algo = {};
   if (plan.stopPx) { algo.slTriggerPx = String(plan.stopPx); algo.slOrdPx = "-1"; }
-  if (plan.takeProfitPx) { algo.tpTriggerPx = String(plan.takeProfitPx); algo.tpOrdPx = "-1"; }
+  // 止盈不挂到交易所（与桌面版一致）：只托管止损，止盈由人工了结。
+  // 想恢复"止损+止盈一起托管"，在这里补回 tpTriggerPx / tpOrdPx 即可。
   if (Object.keys(algo).length) body.attachAlgoOrds = [algo];
   return body;
 }

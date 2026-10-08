@@ -567,8 +567,16 @@ def test_execute_sends_order_with_stop_attached():
     assert order["inst_id"] == "BTC-USDT-SWAP"
     assert order["side"] == "buy" and order["ord_type"] == "limit"
     assert order["stop_px"] == pytest.approx(84900)
-    assert order["take_profit_px"] == pytest.approx(85200)
+    # 默认只挂止损：止盈不托管到交易所，由人工了结
+    assert order["take_profit_px"] is None
     assert client.leverage == [("BTC-USDT-SWAP", 3, "cross")]
+
+
+def test_execute_can_still_attach_take_profit_when_enabled():
+    """把 attach_take_profit 打开时，恢复"止损+止盈一起托管"。"""
+    trader, client, _market = _trader(attach_take_profit=True)
+    trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
+    assert client.orders[0]["take_profit_px"] == pytest.approx(85200)
 
 
 def test_execute_blocked_when_disabled():

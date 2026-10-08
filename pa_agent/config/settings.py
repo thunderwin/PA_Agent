@@ -159,6 +159,9 @@ class TradingSettings(BaseModel):
     max_loss_per_trade_usd: float = Field(default=10.0, gt=0, le=10_000)
     #: 单笔名义额上限（USDT）；0 = 不限制。触顶时自动缩量——实际风险只会更小，不会更大。
     max_notional_usd: float = Field(default=0.0, ge=0.0, le=1_000_000)
+    #: 是否把 AI 算出的止盈一并挂到交易所。
+    #: False（默认）= 只挂止损，止盈由人工了结；True = 恢复"止损+止盈一起托管"。
+    attach_take_profit: bool = False
     #: 当日（UTC+8）累计已实现亏损上限，超过后当天不再下单。
     daily_loss_cap_usd: float = Field(default=30.0, gt=0, le=100_000)
     #: 同时持有的最大仓位数。

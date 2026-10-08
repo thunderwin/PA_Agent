@@ -957,6 +957,9 @@ class OkxTrader:
 
         if spec.derivative:
             self.client.set_leverage(plan.inst_id, plan.leverage)
+        # 止盈默认不挂到交易所（attach_take_profit=False）：
+        # 只托管止损，止盈由人工了结，避免 AI 的结构目标把仓位提前平掉。
+        attach_tp = bool(getattr(s, "attach_take_profit", False))
         row = self.client.place_order(
             inst_id=plan.inst_id,
             side=plan.side,
@@ -965,7 +968,7 @@ class OkxTrader:
             price=plan.price if plan.ord_type == "limit" else None,
             trigger_px=plan.price if plan.ord_type == "trigger" else None,
             stop_px=plan.stop_px,
-            take_profit_px=plan.take_profit_px,
+            take_profit_px=plan.take_profit_px if attach_tp else None,
             td_mode="cross" if spec.derivative else "cash",
         )
         return ExecutionResult(
