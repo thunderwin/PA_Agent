@@ -702,6 +702,7 @@ def format_plan_confirmation(
     order_type_label: str = "",
     simulated: bool = True,
     equity_usd: float | None = None,
+    venue: str = "",
 ) -> str:
     """下单前确认框里的文字 —— 把「以损定量」的每个数字摊开给人核对。"""
     qty_unit = "张" if plan.base_qty != plan.size else "币"
@@ -710,7 +711,7 @@ def format_plan_confirmation(
     margin = plan.notional_usd / max(plan.leverage, 1)
 
     lines = [
-        f"【OKX {'模拟盘' if simulated else '实盘'} 下单确认】",
+        f"【{venue or 'OKX'} {'模拟盘' if simulated else '实盘'} 下单确认】",
         f"品种 / 周期：{symbol or plan.inst_id} {timeframe}".rstrip(),
         f"方向 / 类型：{'做多' if plan.side == 'buy' else '做空'}"
         f" · {order_type_label or plan.ord_type}",
@@ -1056,6 +1057,35 @@ class OkxTrader:
 
     def close_all(self, inst_id: str) -> dict[str, Any]:
         return self.client.close_position(inst_id)
+
+    def ensure_stops(self, inst_id: str | None = None) -> list[str]:
+        """核对"有持仓但没止损"的仓位，返回说明（**不补挂**）。
+
+        OKX 的止损是随入场单一起托管的（``attachAlgoOrds``），成交后自动生效，
+        所以这一侧只做体检：发现没有止损单就告警，让你去补。
+        币安网关因为没有这个机制，同名方法会**真的补挂**（见 ``binance_trader``）。
+        两边同名，是为了让上层（监控线程）能一视同仁地调用。
+        """
+        notes: list[str] = []
+        try:
+            rows = self.client.positions(inst_id=inst_id)
+        except Exception as exc:  # noqa: BLE001
+            return [f"持仓查询失败：{exc}"]
+        for row in rows:
+            symbol = str(row.get("instId") or "")
+            if not symbol or abs(_as_float(row.get("pos")) or 0.0) <= 0:
+                continue
+            try:
+                algo = self.client.algo_pending(inst_id=symbol, ord_type="oco")
+                algo += self.client.algo_pending(inst_id=symbol, ord_type="conditional")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"{symbol} 止损失败核对：{exc}")
+                continue
+            if any(str(r.get("slTriggerPx") or "").strip() for r in algo):
+                continue
+            notes.append(f"⚠️ {symbol} 有持仓但没检测到止损单，请到 OKX 确认")
+            logger.warning("⚠️ %s 有持仓但没检测到止损单，请立即到 OKX 补挂", symbol)
+        return notes
 
     def cancel_stale_entries(
         self,

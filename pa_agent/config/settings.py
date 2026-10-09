@@ -143,14 +143,23 @@ class GeneralSettings(BaseModel):
 
 
 class TradingSettings(BaseModel):
-    """OKX 真实下单设置（默认全关；凭据不写在这里）。
+    """真实下单设置（默认全关；凭据不写在这里）。
 
-    凭据只从环境变量（``OKX_API_KEY`` / ``OKX_SECRET_KEY`` / ``OKX_PASSPHRASE``）
-    或 ``credentials_path`` 指向的文件读取，避免跟着 settings.json 到处跑。
+    支持两个交易所，由 ``venue`` 选择：
+
+    - ``okx``：凭据来自环境变量（``OKX_API_KEY`` / ``OKX_SECRET_KEY`` /
+      ``OKX_PASSPHRASE``）或 ``okx_credentials_path``（默认沿用老字段
+      ``credentials_path`` = ``config/okx_trading.json``）。
+    - ``binance``：凭据来自 ``BINANCE_API_KEY`` / ``BINANCE_SECRET_KEY``
+      或 ``binance_credentials_path``。
+
+    凭据永远不进 settings.json，避免跟着配置到处跑。
     """
 
     model_config = ConfigDict(extra="ignore")
 
+    #: 用哪个交易所下单：okx / binance（认不出的值一律回落到 okx）。
+    venue: str = "okx"
     #: 总开关。False 时任何下单请求都会被拒绝。
     enabled: bool = False
     #: True = OKX 模拟盘（请求头 x-simulated-trading: 1）；False = 实盘。
@@ -179,8 +188,16 @@ class TradingSettings(BaseModel):
     min_confidence: int = Field(default=60, ge=0, le=100)
     #: 允许下单的品种白名单；空列表 = 只允许当前订阅的品种。
     allowed_symbols: list[str] = Field(default_factory=list)
-    #: 凭据文件（JSON，内含 api_key/secret_key/passphrase），务必不要提交到 Git。
+    #: OKX 凭据文件（JSON，内含 api_key/secret_key/passphrase），务必不要提交到 Git。
     credentials_path: str = "config/okx_trading.json"
+    #: OKX 凭据文件的显式配置（留空则沿用上面的 ``credentials_path``）。
+    okx_credentials_path: str = ""
+    #: 币安凭据文件（JSON，内含 api_key/secret_key）。
+    binance_credentials_path: str = "config/binance_trading.json"
+    #: 各交易所的代理（留空则用环境变量 ``PA_OKX_PROXY`` / ``PA_BINANCE_PROXY``，
+    #: 再留空就用系统代理）。两家出口要求可能不同，所以分开配。
+    okx_proxy: str = ""
+    binance_proxy: str = ""
 
 
 _FEISHU_CONFIG_KEYS = (

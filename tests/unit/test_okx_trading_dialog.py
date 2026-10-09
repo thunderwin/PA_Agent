@@ -147,3 +147,59 @@ def test_dialog_requires_credentials_when_enabled(qapp, settings_and_path, monke
 
     assert warnings and "API Key" in warnings[0]
     assert settings.trading.enabled is False
+
+
+# ── 交易所切换（OKX / 币安）──────────────────────────────────────────────────
+
+
+def test_dialog_switches_venue_and_hides_passphrase(qapp, settings_and_path):
+    settings, _ = settings_and_path
+    dlg = OkxTradingDialog(settings)
+    assert dlg._venue() == "okx"
+    assert dlg._passphrase_edit.isVisible() or not dlg.isVisible()   # 未显示时不可判定
+    assert "okx_trading.json" in dlg._cred_path_label.text()
+
+    idx = dlg._venue_combo.findData("binance")
+    dlg._venue_combo.setCurrentIndex(idx)
+    assert dlg._venue() == "binance"
+    assert dlg._passphrase_edit.isHidden()
+    assert "binance_trading.json" in dlg._cred_path_label.text()
+    assert "币安" in dlg._cred_hint_label.text()
+
+    dlg._venue_combo.setCurrentIndex(dlg._venue_combo.findData("okx"))
+    assert not dlg._passphrase_edit.isHidden()
+
+
+def test_dialog_saves_binance_credentials(qapp, settings_and_path, monkeypatch, tmp_path):
+    settings, _ = settings_and_path
+    settings.trading.binance_credentials_path = str(tmp_path / "binance_trading.json")
+    monkeypatch.setattr(dialog_mod, "save_settings", lambda s, p=None: None)
+
+    dlg = OkxTradingDialog(settings)
+    dlg._venue_combo.setCurrentIndex(dlg._venue_combo.findData("binance"))
+    dlg._api_key_edit.setText("bn-key")
+    dlg._secret_edit.setText("bn-secret")
+    dlg._enabled_check.setChecked(True)
+    dlg._demo_radio.setChecked(True)
+    dlg._on_save()
+
+    assert dlg.result() == int(QDialog.DialogCode.Accepted)
+    payload = json.loads((tmp_path / "binance_trading.json").read_text(encoding="utf-8"))
+    assert payload == {"api_key": "bn-key", "secret_key": "bn-secret"}   # 没有 passphrase
+    assert settings.trading.venue == "binance"
+
+
+def test_dialog_binance_requires_two_fields(qapp, settings_and_path, monkeypatch):
+    settings, _ = settings_and_path
+    monkeypatch.setattr(dialog_mod, "save_settings", lambda s, p=None: None)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning", lambda *a, **k: warnings.append(a[2] if len(a) > 2 else "")
+    )
+    dlg = OkxTradingDialog(settings)
+    dlg._venue_combo.setCurrentIndex(dlg._venue_combo.findData("binance"))
+    dlg._api_key_edit.setText("bn-key")          # 只填了 key
+    dlg._enabled_check.setChecked(True)
+    dlg._on_save()
+    assert warnings and "币安" in warnings[0]
+    assert settings.trading.enabled is False

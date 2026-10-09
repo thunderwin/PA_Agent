@@ -3,6 +3,11 @@
 PA Agent 可以把 **OKX 的现货 / 永续** 直接当作 K 线数据源，用同一套两阶段 AI 分析流程
 分析 BTC、ETH 等高流动性品种。**本接入只读取公开行情，不含任何下单动作。**
 
+> **下单部分已升级为双交易所**（2026-10-09）：OKX 与币安共用同一套风控核心，
+> 由 `config/settings.json` 的 `trading.venue` 切换，见
+> [交易网关说明](交易网关说明.md)。本文第 6 节的"真实下单"仍然以 OKX 为例讲解，
+> 但界面菜单已改名为 **「交易设置（OKX / 币安）」**。
+
 ---
 
 ## 1. 怎么用
@@ -162,6 +167,7 @@ OKX 每行 K 线是 `[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]`，程�
 
 | 项 | 值 |
 |----|----|
+| `trading.venue` | `okx`（`binance` = 换币安下单，见 [交易网关说明](交易网关说明.md)） |
 | `general.watch_timeframe` | `1h` |
 | `general.watch_concurrency` | `10`（并发分析线程数） |
 | `general.watch_skip_occupied` | `true`（已持仓/已挂单的品种跳过分析） |

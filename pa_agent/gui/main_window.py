@@ -500,8 +500,8 @@ class MainWindow(QMainWindow):
         _general_action.triggered.connect(self._open_general_settings_dialog)
         menu_bar.addAction(_general_action)
 
-        # 4. OKX 交易设置（实盘/模拟盘、凭据、以损定量参数）
-        _okx_action = QAction("OKX 交易设置", self)
+        # 4. 交易设置（选交易所 OKX/币安、实盘/模拟盘、凭据、以损定量参数）
+        _okx_action = QAction("交易设置（OKX / 币安）", self)
         _okx_action.triggered.connect(self._open_okx_trading_dialog)
         menu_bar.addAction(_okx_action)
 
@@ -724,7 +724,7 @@ class MainWindow(QMainWindow):
         self._execute_btn.setMinimumWidth(96)
         self._execute_btn.setEnabled(False)
         self._execute_btn.setToolTip(
-            "开启「OKX 交易设置 → 允许下单」且分析出可执行方案后可用；"
+            "开启「交易设置 → 允许下单」且分析出可执行方案后可用；"
             "点击后会先弹出确认框，列出止损距离与按此算出的下单量"
         )
         self._execute_btn.clicked.connect(lambda: self._execute_order(interactive=True))
@@ -4499,11 +4499,11 @@ class MainWindow(QMainWindow):
         tf = str(getattr(general, "watch_timeframe", "") or "")
         return tf or self._tf_combo.currentText()
 
-    def _make_okx_trader(self) -> Any:
-        """按当前设置造一个 OKX 执行器（只用来读持仓/挂单状态）。"""
-        from pa_agent.trading.okx_trader import OkxTrader
+    def _make_trader(self) -> Any:
+        """按当前设置造一个交易网关（OKX 或币安，只用来读持仓/挂单状态）。"""
+        from pa_agent.trading.gateway import create_trader
 
-        return OkxTrader.from_settings(self._ctx.settings)
+        return create_trader(self._ctx.settings)
 
     def _watchlist_targets(self) -> list[Any]:
         from pa_agent.orchestrator.watchlist import WatchTarget
@@ -4587,7 +4587,7 @@ class MainWindow(QMainWindow):
             interval_s=int(getattr(general, "watch_interval_s", 60) or 60),
             concurrency=int(getattr(general, "watch_concurrency", 1) or 1),
             skip_occupied=bool(getattr(general, "watch_skip_occupied", True)),
-            make_trader=self._make_okx_trader,
+            make_trader=self._make_trader,
             make_orchestrator=self._build_orchestrator,
             parent=None,
         )
@@ -4619,7 +4619,33 @@ class MainWindow(QMainWindow):
         # 触发方式=auto 时，多品种监控出的方案直接下单（同一套闸门：以损定量/持仓/日亏…）
         self._maybe_auto_execute_watch(result)
         # 入场挂单过期清理：超过 N 根 K 线未成交的挂单自动撤掉（只撤程序自己的单）
-        self._expire_stale_entries(str(getattr(result, "symbol", "") or ""))
+        symbol = str(getattr(result, "symbol", "") or "")
+        self._expire_stale_entries(symbol)
+        # 止损体检：币安没有"附带止损"，成交后必须由程序补挂（OKX 只核对告警）
+        self._ensure_stops(symbol)
+
+    def _ensure_stops(self, symbol: str = "") -> None:
+        """核对/补挂止损（网关自己决定怎么做）。"""
+        trading = self._trading_settings()
+        if trading is None or not getattr(trading, "enabled", False):
+            return
+        settings = self._ctx.settings
+
+        import threading
+
+        def _run() -> None:
+            from pa_agent.trading.gateway import create_trader
+
+            try:
+                trader = create_trader(settings)
+                notes = trader.ensure_stops(symbol or None)
+                for note in notes:
+                    logger.warning("止损体检：%s", note)
+                    self.trade_note.emit(f"止损体检：{note}")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("止损体检失败（%s）：%s", symbol, exc)
+
+        threading.Thread(target=_run, name="ensure-stops", daemon=True).start()
 
     def _expire_stale_entries(self, symbol: str) -> None:
         """按 settings.trading.pending_entry_expiry_bars 撤掉过期的入场挂单。"""
@@ -4635,10 +4661,10 @@ class MainWindow(QMainWindow):
         import threading
 
         def _run() -> None:
-            from pa_agent.trading.okx_trader import OkxTrader
+            from pa_agent.trading.gateway import create_trader
 
             try:
-                trader = OkxTrader.from_settings(settings)
+                trader = create_trader(settings)
                 done = trader.cancel_stale_entries(symbol, timeframe, max_bars=max_bars)
                 if done:
                     self.trade_note.emit(
@@ -4674,7 +4700,7 @@ class MainWindow(QMainWindow):
         settings = self._ctx.settings
 
         def _run() -> None:
-            from pa_agent.trading.okx_trader import OkxTrader
+            from pa_agent.trading.gateway import create_trader
 
             import threading
 
@@ -4685,7 +4711,7 @@ class MainWindow(QMainWindow):
             # 加锁串行化，避免同时通过上限检查而超额开仓。
             with lock:
                 try:
-                    trader = OkxTrader.from_settings(settings)
+                    trader = create_trader(settings)
                     outcome: Any = trader.execute(
                         decision, symbol=symbol, dry_run=False, manual_confirm=False
                     )
@@ -4712,7 +4738,7 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"已切换到 {symbol} {timeframe}")
 
     def _open_okx_trading_dialog(self) -> None:
-        """打开 OKX 交易设置（凭据、实盘/模拟盘、以损定量参数）."""
+        """打开交易设置（交易所、凭据、实盘/模拟盘、以损定量参数）."""
         from pa_agent.config.settings import Settings
         from pa_agent.gui.okx_trading_dialog import OkxTradingDialog
 
@@ -4731,13 +4757,13 @@ class MainWindow(QMainWindow):
         return getattr(settings, "trading", None)
 
     def _trading_status_text(self) -> str:
-        from pa_agent.trading.okx_trader import OkxTrader
+        from pa_agent.trading.gateway import create_trader
 
         settings = getattr(self._ctx, "settings", None)
         if settings is None or getattr(settings, "trading", None) is None:
             return "交易：未配置"
         try:
-            return OkxTrader.from_settings(settings).status_text()
+            return create_trader(settings).status_text()
         except Exception as exc:  # noqa: BLE001
             logger.debug("交易状态读取失败: %s", exc)
             return "交易：状态未知"
@@ -4768,7 +4794,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "_ui_is_alive", lambda: True)():
             btn.setEnabled(ok)
         if not enabled:
-            btn.setToolTip("未开启下单：菜单「OKX 交易设置」里打开开关并填好 API 凭据")
+            btn.setToolTip("未开启下单：菜单「交易设置」里打开开关并填好 API 凭据")
         elif not executable:
             btn.setToolTip("当前决策没有可执行订单（「不下单」或缺少止损价）")
         else:
@@ -4778,13 +4804,14 @@ class MainWindow(QMainWindow):
             )
 
     def _execute_order(self, *, interactive: bool) -> None:
-        """把当前决策变成 OKX 订单；interactive=True 时先弹确认框。"""
-        from pa_agent.trading.okx_trader import (
-            OkxTradeError,
-            OkxTrader,
+        """把当前决策变成订单（交易所由 settings.trading.venue 决定）；interactive=True 先弹确认框。"""
+        from pa_agent.trading.gateway import (
+            TradeError,
             TradeRejected,
+            create_trader,
             format_plan_confirmation,
             is_executable_decision,
+            venue_label,
         )
 
         settings = getattr(self._ctx, "settings", None)
@@ -4803,7 +4830,7 @@ class MainWindow(QMainWindow):
         price = self._reference_price_for_order()
 
         try:
-            trader = OkxTrader.from_settings(settings)
+            trader = create_trader(settings)
             preview = trader.execute(decision, symbol=symbol, dry_run=True, price=price)
         except TradeRejected as exc:
             if interactive:
@@ -4811,9 +4838,9 @@ class MainWindow(QMainWindow):
             else:
                 self._status_bar.showMessage(f"自动下单跳过：{exc}")
             return
-        except OkxTradeError as exc:
+        except TradeError as exc:
             if interactive:
-                QMessageBox.critical(self, "OKX 接口错误", str(exc))
+                QMessageBox.critical(self, "交易所接口错误", str(exc))
             else:
                 self._status_bar.showMessage(f"自动下单失败：{exc}")
             return
@@ -4838,6 +4865,7 @@ class MainWindow(QMainWindow):
                 timeframe=timeframe,
                 order_type_label=str(decision.get("order_type") or ""),
                 simulated=simulated,
+                venue=venue_label(getattr(settings.trading, "venue", "okx")),
             )
             if preview.guard and preview.guard.notes:
                 detail += "\n" + "；".join(preview.guard.notes)
@@ -4874,7 +4902,7 @@ class MainWindow(QMainWindow):
         """下单走后台线程，避免网络往返冻结界面。"""
         import threading
 
-        self._status_bar.showMessage("正在提交 OKX 订单…")
+        self._status_bar.showMessage("正在提交交易所订单…")
         btn = getattr(self, "_execute_btn", None)
         if btn is not None:
             btn.setEnabled(False)

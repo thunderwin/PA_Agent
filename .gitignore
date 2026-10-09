@@ -28,6 +28,9 @@ config/feishu.json
 # OKX 下单凭据（含交易权限，绝不要提交）
 config/okx_trading.json
 config/okx_trading*.bak*
+# 币安下单凭据（含交易权限，绝不要提交）
+config/binance_trading.json
+config/binance_trading*.bak*
 # 单实例锁（运行时状态）
 config/.pa_agent.lock
 *.pem
