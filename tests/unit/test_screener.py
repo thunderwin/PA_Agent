@@ -36,19 +36,23 @@ def _series(baseline: float, window_volume: float, *, base_bars: int = BAR_HOURS
 
 CFG = ScreenConfig()
 
+#: 过门槛用的量级：基线 40 万/小时（24h ≈ 1050 万），放量 8 倍（24h ≈ 2640 万）
+_LIQ_BASE = 400_000.0
+_LIQ_BURST = 3_200_000.0
+
 
 # ── 基础门槛 ──────────────────────────────────────────────────────────────────
 
 
 def test_flat_then_burst_is_a_candidate():
     """平常量 + 最后 6 根放量 8 倍 → 应该入选。"""
-    bars = _bars(_series(100_000.0, 800_000.0))
+    bars = _bars(_series(_LIQ_BASE, _LIQ_BURST))
     cand = evaluate_bars(bars, "ABC-USDT-SWAP", CFG)
     assert cand is not None and cand.ok, cand.reasons
     assert cand.ratio == pytest.approx(8.0, rel=0.05)
     assert cand.burst > CFG.min_burst
     assert cand.persist == 6
-    assert cand.volume_24h_usd == pytest.approx(6.6e6, rel=0.02)
+    assert cand.volume_24h_usd == pytest.approx(2.64e7, rel=0.02)
 
 
 def test_burst_must_be_recent():
@@ -93,7 +97,7 @@ def test_not_enough_history_returns_none():
 
 
 def test_wide_spread_is_rejected():
-    cand = evaluate_bars(_bars(_series(100_000.0, 800_000.0)), "WIDE-USDT-SWAP", CFG,
+    cand = evaluate_bars(_bars(_series(_LIQ_BASE, _LIQ_BURST)), "WIDE-USDT-SWAP", CFG,
                          spread_bp=45.0)
     assert cand is not None and not cand.ok
     assert any("点差" in r for r in cand.reasons)
@@ -159,12 +163,12 @@ def test_universe_respects_exclude():
 
 def test_rank_prefilters_by_24h_volume():
     """粗筛：24h 成交额不够的不去拉 K 线（省一次请求）。"""
-    good = _series(100_000.0, 800_000.0)
+    good = _series(_LIQ_BASE, _LIQ_BURST)
     data = {
         "BIG-USDT-SWAP": _bars(good),
         "SMALL-USDT-SWAP": _bars(good),
     }
-    src = _FakeSource(data, volumes={"BIG-USDT-SWAP": 5e6, "SMALL-USDT-SWAP": 100_000.0})
+    src = _FakeSource(data, volumes={"BIG-USDT-SWAP": 3e7, "SMALL-USDT-SWAP": 1e6})
     ranked = rank_candidates(src, CFG, symbols=list(data))
     assert [c.symbol for c in ranked] == ["BIG-USDT-SWAP"]
 
@@ -216,6 +220,38 @@ def test_pick_symbols_can_disable_correlation_check():
     assert [c.symbol for c in picked] == ["X-USDT-SWAP", "Y-USDT-SWAP"]
 
 
+def test_pick_symbols_rejects_thin_order_book():
+    """成交额够但盘口太薄的品种要挡掉，顺延下一个。"""
+
+    class _DepthSource(_FakeSource):
+        def depth(self, inst_id, limit=5):
+            return {"THIN-USDT-SWAP": 1_200.0}.get(inst_id, 80_000.0)
+
+    ranked = [_cand("THIN-USDT-SWAP", 9.0, ()), _cand("DEEP-USDT-SWAP", 8.0, ())]
+    picked = pick_symbols(_DepthSource({}), CFG, count=2, candidates=ranked)
+    assert [c.symbol for c in picked] == ["DEEP-USDT-SWAP"]
+    assert any("盘口太薄" in r for r in ranked[0].reasons)
+
+
+def test_pick_symbols_depth_check_can_be_disabled():
+    class _DepthSource(_FakeSource):
+        def depth(self, inst_id, limit=5):
+            return 100.0
+
+    ranked = [_cand("THIN-USDT-SWAP", 9.0, ())]
+    cfg = ScreenConfig(min_depth_usd=0.0)
+    assert [c.symbol for c in pick_symbols(_DepthSource({}), cfg, count=1,
+                                           candidates=ranked)] == ["THIN-USDT-SWAP"]
+
+
+def test_pick_symbols_never_returns_more_than_count():
+    """达标 5 个也只取前 2 个。"""
+    ranked = [_cand(f"C{i}-USDT-SWAP", 10.0 - i, ()) for i in range(5)]
+    picked = pick_symbols(_FakeSource({}), ScreenConfig(max_correlation=0.0), count=2,
+                          candidates=ranked)
+    assert len(picked) == 2
+
+
 # ── 与配置对接 ────────────────────────────────────────────────────────────────
 
 
@@ -223,15 +259,21 @@ def test_config_from_settings_reads_general_fields():
     from pa_agent.config.settings import GeneralSettings
 
     general = GeneralSettings(
-        watch_dynamic_min_volume_usd=5e6,
+        watch_dynamic_min_volume_usd=5e7,
         watch_dynamic_max_volume_usd=1e8,
         watch_dynamic_min_burst=9.0,
+        watch_dynamic_min_window_usd=2e6,
+        watch_dynamic_max_spread_bp=8.0,
+        watch_dynamic_min_depth_usd=9_000.0,
         watch_dynamic_exclude=["btc-usdt-swap", " MERL-USDT-SWAP "],
     )
     cfg = ScreenConfig.from_settings(general)
-    assert cfg.min_volume_usd == 5e6
+    assert cfg.min_volume_usd == 5e7
     assert cfg.max_volume_usd == 1e8
     assert cfg.min_burst == 9.0
+    assert cfg.min_window_usd == 2e6
+    assert cfg.max_spread_bp == 8.0
+    assert cfg.min_depth_usd == 9_000.0
     assert cfg.exclude == ("BTC-USDT-SWAP", "MERL-USDT-SWAP")   # 统一大写并去空格
 
 

@@ -359,6 +359,42 @@ class BinanceSource(DataSource):
         )
         return _to_float((payload or {}).get("bidPrice")), _to_float((payload or {}).get("askPrice"))
 
+    def depth(self, inst_id: str, limit: int = 500, band_pct: float = 0.5) -> float:
+        """中位价 **±band_pct%** 内、买卖两侧里**较小**的累计名义额（USDT）。
+
+        选币的最后一道闸门：成交额再大，盘口薄一样会滑点。
+        不用"前 5 档"是因为那个口径受最小变动价位影响极大——实测 JCT 有 7850 万
+        日成交额，前 5 档却只有 2097 USDT；换成本口径是 8596 USDT，才可比。
+        """
+        canonical = normalize_binance_symbol(inst_id)
+        if not canonical:
+            raise DataSourceError(f"币安品种无效: {inst_id!r}")
+        payload = _http_get_json(
+            "/fapi/v1/depth",
+            {"symbol": f"{canonical.split('-')[0]}USDT", "limit": str(int(limit))},
+        )
+        bids = (payload or {}).get("bids") or []
+        asks = (payload or {}).get("asks") or []
+        if not bids or not asks:
+            return 0.0
+        bid0, ask0 = _to_float(bids[0][0]), _to_float(asks[0][0])
+        if bid0 <= 0 or ask0 <= 0:
+            return 0.0
+        mid = (bid0 + ask0) / 2.0
+        lower, upper = mid * (1 - band_pct / 100.0), mid * (1 + band_pct / 100.0)
+
+        def _total(rows: list, keep) -> float:
+            return sum(
+                _to_float(r[0]) * _to_float(r[1])
+                for r in rows
+                if len(r) >= 2 and keep(_to_float(r[0]) or 0.0)
+            )
+
+        return min(
+            _total(bids, lambda px: px >= lower),
+            _total(asks, lambda px: px <= upper),
+        )
+
     def book_tickers(self) -> dict[str, float]:
         """全市场点差（规范写法 → bp），一次请求拿全 —— 选币用这个，别逐币查。"""
         rows = _http_get_json("/fapi/v1/ticker/bookTicker") or []

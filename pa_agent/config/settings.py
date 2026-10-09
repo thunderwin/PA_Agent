@@ -116,12 +116,18 @@ class GeneralSettings(BaseModel):
     #: 每轮选几个（用户要的是 2 个）
     watch_dynamic_count: int = Field(default=2, ge=1, le=20)
     #: 多久重选一次（分钟）
-    watch_dynamic_refresh_min: int = Field(default=60, ge=5, le=1440)
+    watch_dynamic_refresh_min: int = Field(default=120, ge=5, le=1440)
     #: True = 保留静态列表并**追加**选出来的（默认 False = 整个换掉）
     watch_dynamic_keep_static: bool = False
     #: 选币门槛：24h 成交额区间（USDT）
-    watch_dynamic_min_volume_usd: float = Field(default=2_000_000.0, gt=0)
+    watch_dynamic_min_volume_usd: float = Field(default=20_000_000.0, gt=0)
     watch_dynamic_max_volume_usd: float = Field(default=400_000_000.0, gt=0)
+    #: 选币门槛：最近 6 小时成交额下限（USDT）
+    watch_dynamic_min_window_usd: float = Field(default=1_000_000.0, gt=0)
+    #: 选币门槛：点差上限（bp）
+    watch_dynamic_max_spread_bp: float = Field(default=15.0, gt=0)
+    #: 选币门槛：盘口前 5 档较小一侧的名义额下限（USDT）——防"有量但盘口薄"
+    watch_dynamic_min_depth_usd: float = Field(default=20_000.0, gt=0)
     #: 选币门槛：突变强度（稳健 z 分数）
     watch_dynamic_min_burst: float = Field(default=6.0, gt=0)
     #: 选币时额外排除的品种（规范写法）

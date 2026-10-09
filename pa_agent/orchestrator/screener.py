@@ -57,15 +57,21 @@ class ScreenConfig:
 
     window_hours: int = 6
     bars: int = 300
-    min_volume_usd: float = 2_000_000.0
+    #: 24h 成交额下限（2026-10-09 从 200 万上调到 2000 万：薄币点差大、滑点大）
+    min_volume_usd: float = 20_000_000.0
     max_volume_usd: float = 400_000_000.0
     min_burst: float = 6.0
     min_ratio: float = 3.0
     day_ratio: float = 2.5
     quiet_max: float = 2.0
-    min_window_usd: float = 300_000.0
+    min_window_usd: float = 1_000_000.0
     min_persist: int = 3
-    max_spread_bp: float = 20.0
+    max_spread_bp: float = 15.0
+    #: 盘口"中位价 ±0.5% 内较小一侧"累计名义额的下限（USDT）
+    #: 2 万 ≈ 实际下单量（约 130 USDT）只吃到可见深度的 0.7%，留足余量
+    min_depth_usd: float = 20_000.0
+    #: 最多往下探几个候选去验深度（验一次 = 一次请求，不扫全市场）
+    max_depth_probe: int = 8
     max_gap_ratio: float = 0.10
     max_correlation: float = 0.6
     exclude: tuple[str, ...] = ()
@@ -77,13 +83,25 @@ class ScreenConfig:
             return cls()
         return cls(
             min_volume_usd=float(
-                getattr(general, "watch_dynamic_min_volume_usd", 2_000_000.0) or 2_000_000.0
+                getattr(general, "watch_dynamic_min_volume_usd", 20_000_000.0)
+                or 20_000_000.0
             ),
             max_volume_usd=float(
                 getattr(general, "watch_dynamic_max_volume_usd", 400_000_000.0)
                 or 400_000_000.0
             ),
             min_burst=float(getattr(general, "watch_dynamic_min_burst", 6.0) or 6.0),
+            min_window_usd=float(
+                getattr(general, "watch_dynamic_min_window_usd", 1_000_000.0)
+                or 1_000_000.0
+            ),
+            max_spread_bp=float(
+                getattr(general, "watch_dynamic_max_spread_bp", 15.0) or 15.0
+            ),
+            min_depth_usd=float(
+                getattr(general, "watch_dynamic_min_depth_usd", 20_000.0)
+                or 20_000.0
+            ),
             exclude=tuple(
                 str(s).strip().upper()
                 for s in (getattr(general, "watch_dynamic_exclude", []) or [])
@@ -107,6 +125,8 @@ class Candidate:
     persist: int
     spread_bp: float
     price: float
+    #: 盘口前 5 档较小一侧的累计名义额（只有入选候选才去验，未验时 0）
+    depth_usd: float = 0.0
     score: float = 0.0
     #: 未通过的硬门槛（空 = 合格）
     reasons: tuple[str, ...] = ()
@@ -387,13 +407,18 @@ def pick_symbols(
     exclude: Iterable[str] = (),
     candidates: list[Candidate] | None = None,
 ) -> list[Candidate]:
-    """挑出 ``count`` 个达标标的：按分数取，并做**相关性去重**。"""
+    """挑出 ``count`` 个达标标的：按分数取，做**相关性去重**与**盘口深度**验证。
+
+    ``count`` 是上限——所以"超过两个也只取前两个"是天然成立的（默认 count=2）。
+    """
     cfg = cfg or ScreenConfig()
     ranked = (
         candidates
         if candidates is not None
         else rank_candidates(source, cfg, exclude=exclude)
     )
+    depth_hook = getattr(source, "depth", None) if cfg.min_depth_usd > 0 else None
+    probed = 0
     picked: list[Candidate] = []
     for cand in ranked:
         if not cand.ok:
@@ -404,6 +429,23 @@ def pick_symbols(
         ):
             logger.info("跳过 %s：与已选标的相关系数过高", cand.symbol)
             continue
+        # 盘口深度：只对少数排在前面的候选验一次（一次请求一个品种）
+        if callable(depth_hook) and probed < max(int(cfg.max_depth_probe), 1):
+            probed += 1
+            try:
+                cand.depth_usd = float(depth_hook(cand.symbol))
+            except Exception as exc:  # noqa: BLE001 - 验不了就别拦（点差门槛仍在）
+                logger.warning("验 %s 盘口深度失败，跳过这项检查: %s", cand.symbol, exc)
+            else:
+                if 0 < cand.depth_usd < cfg.min_depth_usd:
+                    logger.info(
+                        "跳过 %s：±0.5%% 盘口深度只有 %.0f USDT（要求 ≥ %.0f）",
+                        cand.symbol, cand.depth_usd, cfg.min_depth_usd,
+                    )
+                    cand.reasons = cand.reasons + (
+                        f"盘口太薄（±0.5% 内 {cand.depth_usd:.0f} USDT < {cfg.min_depth_usd:.0f}）",
+                    )
+                    continue
         picked.append(cand)
         if len(picked) >= max(int(count), 1):
             break
@@ -433,13 +475,18 @@ def _cli() -> int:  # pragma: no cover - 手动跑用
     hits = [c for c in ranked if c.ok]
     print(f"达标 {len(hits)} 个 / 评估 {len(ranked)} 个\n")
     print(f"{'品种':<20}{'burst':>7}{'放大':>7}{'今天/昨天':>10}{'6h(万)':>9}"
-          f"{'24h(百万)':>11}{'点差bp':>8}{'持续':>5}")
+          f"{'24h(百万)':>11}{'点差bp':>8}{'±0.5%(万)':>11}{'持续':>5}")
     for c in hits[:15]:
         print(f"{c.symbol:<20}{c.burst:>7.1f}{c.ratio:>7.1f}{c.day_ratio:>10.1f}"
               f"{c.volume_window_usd/1e4:>9.0f}{c.volume_24h_usd/1e6:>11.1f}"
-              f"{c.spread_bp:>8.1f}{c.persist:>5}")
+              f"{c.spread_bp:>8.1f}{c.depth_usd/1e4:>11.1f}{c.persist:>5}")
     chosen = pick_symbols(source, cfg, count=args.count, candidates=ranked)
-    print("\n>>> 本轮要盯的：", [c.symbol for c in chosen] or "（无）")
+    print(f"\n（达标 {len(hits)} 个，最多只取前 {args.count} 个）")
+    print(">>> 本轮要盯的：", [c.symbol for c in chosen] or "（无）")
+    for c in chosen:
+        print(f"    {c.symbol}: 24h {c.volume_24h_usd/1e6:.1f}M · 6h {c.volume_window_usd/1e4:.0f}万 · "
+              f"点差 {c.spread_bp:.1f}bp · 前5档 {c.depth_usd/1e4:.1f}万 USDT · "
+              f"突变 {c.burst:.1f} · 放大 {c.ratio:.1f}x")
     return 0
 
 
