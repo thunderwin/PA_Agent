@@ -3,10 +3,15 @@
 与 OKX 的**根本差别**（改代码前先读）
 
 1. **没有"附带止损"这回事**。OKX 可以用 ``attachAlgoOrds`` 把止损跟入场单绑在
-   一起、成交后自动生效；币安只提供独立的 ``STOP_MARKET`` 单。所以这里的流程是：
+   一起、成交后自动生效；币安只能下**独立的条件单**。而且条件单**必须走 Algo
+   Order API**（``/fapi/v1/algoOrder``，字段是 ``triggerPrice`` 而不是 ``stopPrice``）
+   —— 2026-10-09 实测：老接口 ``/fapi/v1/order`` 会直接回
+   ``-4120 Order type not supported for this endpoint``。所以这里的流程是：
    入场 → 看成交状态 → **成交了就补挂止损**。挂单还没成交时，把"打算挂在哪"记进
    ``records/trading_stop_intents.json``，由 :meth:`BinanceTrader.ensure_stops`
    每轮核对补挂。
+   另外注意：币安要求**已有持仓**才能挂 ``closePosition`` 条件单（否则 ``-4509``），
+   这也是"必须成交后补挂"的硬约束。
    ⚠️ 由此产生一个**真实风险**：从成交到止损挂上之间有一个窗口（正常 ≤1 分钟；
    程序若正好崩在这个窗口里，仓位就是裸的）。这是币安的机制限制，不是实现取舍。
 2. **签名不同**：``hex(hmac_sha256(secret, query_string))``，签名串跟在 query 后面；
@@ -130,6 +135,21 @@ def _as_float(value: Any) -> float | None:
     if math.isnan(out) or math.isinf(out):
         return None
     return out
+
+
+def _canonical_or_blank(symbol: Any) -> str:
+    """把币安代码换成规范写法；**空值返回空串**而不是报错。
+
+    撤销/改单这类接口的返回体里经常没有 ``symbol`` 字段，解析时不该因此抛异常
+    （否则一次"撤单成功但解析失败"就会被当成撤单失败，掩盖真实状态）。
+    """
+    text = str(symbol or "").strip().upper()
+    if not text:
+        return ""
+    try:
+        return from_binance_symbol(text)
+    except TradeRejected:
+        return text
 
 
 def _send_http(
@@ -343,10 +363,14 @@ class BinancePrivateClient:
         return payload
 
     def _raise_for_error(self, payload: Any) -> None:
-        if isinstance(payload, dict) and payload.get("code") not in (None, 0):
-            code = payload.get("code")
-            msg = payload.get("msg") or ""
-            raise BinanceTradeError(f"币安接口错误 {code}: {msg}")
+        # 注意：``code`` 既可能是数字（-1121）也可能是字符串；成功时多数接口不带 code，
+        # 但 ``DELETE /fapi/v1/allOpenOrders`` 成功时返回的是 ``{"code":200,...}`` —— 200 也算成功。
+        if not isinstance(payload, dict):
+            return
+        code = payload.get("code")
+        if code in (None, 0, 200, "0", "200"):
+            return
+        raise BinanceTradeError(f"币安接口错误 {code}: {payload.get('msg') or ''}")
 
     # ── 账户 ──────────────────────────────────────────────────────────────────
 
@@ -355,19 +379,21 @@ class BinancePrivateClient:
         return list(data or [])
 
     def equity_usd(self, ccy: str = "USDT") -> float:
-        """账户权益（USDT）。OKX 侧取 ``totalEq``，这里取 ``totalMarginBalance``。"""
+        """账户权益（USDT）。
+
+        必须用 ``/fapi/v2/account``：``/fapi/v2/balance`` 里**没有** ``totalMarginBalance``，
+        只按那份数据取会拿到 ``availableBalance``（= 权益 − 已占用保证金），
+        一开仓就变小，会连带把「按权益收窄仓位」算错。
+        """
         try:
-            rows = self.balance()
+            acct = self.request("GET", "/fapi/v2/account")
         except BinanceTradeError as exc:
             logger.warning("读取币安账户权益失败: %s", exc)
             return 0.0
-        for row in rows:
-            if str(row.get("asset", "")).upper() != ccy.upper():
-                continue
-            for key in ("totalMarginBalance", "totalWalletBalance", "availableBalance"):
-                value = _as_float(row.get(key))
-                if value is not None:
-                    return value
+        for key in ("totalMarginBalance", "totalWalletBalance"):
+            value = _as_float((acct or {}).get(key))
+            if value is not None:
+                return value
         return 0.0
 
     def dual_side_position(self) -> bool:
@@ -416,18 +442,17 @@ class BinancePrivateClient:
     def algo_pending(
         self, inst_id: str | None = None, ord_type: str = "oco"
     ) -> list[dict[str, Any]]:
-        """止损/止盈单（币安没有单独接口，从挂单里筛出来）。
+        """未触发的止损/止盈单（币安的 **Algo Order API**）。
 
         返回项带上 ``slTriggerPx``，让上层共用 OKX 那套"有没有止损"的判断。
         """
-        out: list[dict[str, Any]] = []
-        for row in self.pending_orders(inst_id=inst_id):
-            if str(row.get("type", "")).upper() not in _STOP_TYPES:
-                continue
-            item = dict(row)
-            item["slTriggerPx"] = row.get("stopPx") or ""
-            out.append(item)
-        return out
+        params: dict[str, Any] = {}
+        if inst_id:
+            params["symbol"] = to_binance_symbol(inst_id)
+        rows = self.request("GET", "/fapi/v1/openAlgoOrders", params=params or None)
+        if not isinstance(rows, list):        # 接口异常时别把 dict 当列表迭代
+            return []
+        return [self._normalize_algo_order(row) for row in rows if isinstance(row, dict)]
 
     def occupied_symbols(self, inst_type: str | None = None) -> set[str]:
         """已有持仓**或**有未成交挂单的品种集合（与 OKX 网关同名字段）。"""
@@ -458,7 +483,7 @@ class BinancePrivateClient:
         """把币安订单字段翻译成 OKX 那套名字。"""
         client_id = str(row.get("clientOrderId") or "")
         return {
-            "instId": from_binance_symbol(str(row.get("symbol") or "")),
+            "instId": _canonical_or_blank(row.get("symbol")),
             "ordId": str(row.get("orderId") or ""),
             "clOrdId": client_id,
             "tag": ORDER_TAG if client_id.startswith(ORDER_TAG) else "",
@@ -470,6 +495,31 @@ class BinancePrivateClient:
             "stopPx": _as_float(row.get("stopPrice")) or 0.0,
             "status": str(row.get("status") or ""),
             "executedQty": _as_float(row.get("executedQty")) or 0.0,
+            "raw": row,
+        }
+
+    def _normalize_algo_order(self, row: dict[str, Any]) -> dict[str, Any]:
+        """把 **Algo Order** 字段翻译成同一套名字（止损/止盈走这个接口）。
+
+        实测（2026-10-09）：Algo 单的字段是 ``algoId`` / ``clientAlgoId`` /
+        ``triggerPrice``（不是 ``stopPrice``）/ ``bookTime`` / ``algoStatus``。
+        """
+        client_id = str(row.get("clientAlgoId") or row.get("clientOrderId") or "")
+        trigger = _as_float(row.get("triggerPrice")) or _as_float(row.get("stopPrice")) or 0.0
+        return {
+            "instId": _canonical_or_blank(row.get("symbol")),
+            "ordId": str(row.get("algoId") or row.get("orderId") or ""),
+            "clOrdId": client_id,
+            "tag": ORDER_TAG if client_id.startswith(ORDER_TAG) else "",
+            "side": str(row.get("side") or "").lower(),
+            "sz": _as_float(row.get("quantity")) or _as_float(row.get("origQty")) or 0.0,
+            "px": trigger,
+            "cTime": int(row.get("bookTime") or row.get("time") or 0),
+            "type": str(row.get("orderType") or row.get("type") or ""),
+            "stopPx": trigger,
+            "slTriggerPx": trigger or "",
+            "status": str(row.get("algoStatus") or row.get("status") or ""),
+            "closePosition": str(row.get("closePosition") or ""),
             "raw": row,
         }
 
@@ -552,19 +602,28 @@ class BinancePrivateClient:
         tag: str = ORDER_TAG,
         kind: str = "stop",
     ) -> dict[str, Any]:
-        """挂止损/止盈：优先 ``closePosition=true``（整仓保护），失败退回 ``reduceOnly``+数量。
+        """挂止损/止盈 —— 必须走 **Algo Order API**（2026-10-09 实测）。
+
+        币安已把条件单从 ``/fapi/v1/order`` 迁走：老写法直接报
+        ``-4120 Order type not supported for this endpoint. Please use the Algo Order API``。
+        新接口 ``POST /fapi/v1/algoOrder`` 要求的字段是：``algoType`` / ``symbol`` /
+        ``side`` / ``type`` / **``triggerPrice``**（不是 ``stopPrice``）。
+
+        优先 ``closePosition=true``（整仓保护，仓位翻倍也一次平掉）；失败退回
+        ``reduceOnly`` + 数量。**两者都要求已有持仓**，否则币安回 ``-4509``。
 
         ``side`` 是**平仓方向**：多头仓位的止损是 SELL，空头是 BUY。
         """
         symbol = to_binance_symbol(inst_id)
         order_type = "TAKE_PROFIT_MARKET" if kind == "take_profit" else "STOP_MARKET"
         base: dict[str, Any] = {
+            "algoType": "CONDITIONAL",
             "symbol": symbol,
             "side": str(side).upper(),
             "type": order_type,
-            "stopPrice": _fmt_step(stop_px, tick),
+            "triggerPrice": _fmt_step(stop_px, tick),
             "workingType": "MARK_PRICE",
-            "newClientOrderId": self._client_id("S" if kind == "stop" else "T", tag),
+            "clientAlgoId": self._client_id("S" if kind == "stop" else "T", tag),
         }
         attempts: list[dict[str, Any]] = [{**base, "closePosition": "true"}]
         if size > 0:
@@ -572,17 +631,18 @@ class BinancePrivateClient:
         last: Exception | None = None
         for params in attempts:
             try:
-                row = self.request("POST", "/fapi/v1/order", params=params)
+                row = self.request("POST", "/fapi/v1/algoOrder", params=params)
                 logger.info(
-                    "币安挂 %s 成功 %s @%s", order_type, symbol, params.get("stopPrice")
+                    "币安挂 %s 成功 %s @%s", order_type, symbol, params.get("triggerPrice")
                 )
-                return self._normalize_order(row or {})
+                return self._normalize_algo_order(row or {})
             except BinanceTradeError as exc:
                 last = exc
                 logger.warning("币安挂 %s 失败，换一种方式重试：%s", order_type, exc)
         raise last or BinanceTradeError(f"币安挂 {order_type} 失败")
 
     def cancel_order(self, inst_id: str, ord_id: str) -> dict[str, Any]:
+        """撤**普通**挂单（限价入场单走这里）。"""
         row = self.request(
             "DELETE",
             "/fapi/v1/order",
@@ -590,11 +650,39 @@ class BinancePrivateClient:
         )
         return self._normalize_order(row or {})
 
-    def cancel_all_orders(self, inst_id: str) -> list[dict[str, Any]]:
-        rows = self.request(
-            "DELETE", "/fapi/v1/allOpenOrders", params={"symbol": to_binance_symbol(inst_id)}
+    def cancel_algo_order(self, inst_id: str, algo_id: str) -> dict[str, Any]:
+        """撤**条件单**（止损/止盈走这里）。"""
+        row = self.request(
+            "DELETE",
+            "/fapi/v1/algoOrder",
+            params={"algoId": algo_id},
         )
-        return list(rows or [])
+        return self._normalize_algo_order(row or {})
+
+    def cancel_all_orders(self, inst_id: str) -> list[dict[str, Any]]:
+        """撤掉该品种**所有**程序会的挂单：普通挂单 + Algo 条件单。
+
+        两处都要撤：平仓后若把止损伤留在市场上，等下次再开同品种的仓，
+        那张旧止损会立刻把新仓位打掉——这是很隐蔽的坑。
+        """
+        out: list[dict[str, Any]] = []
+        for row in self.algo_pending(inst_id=inst_id):
+            algo_id = str(row.get("ordId") or "")
+            if not algo_id:
+                continue
+            try:
+                out.append(self.cancel_algo_order(inst_id, algo_id))
+            except Exception as exc:  # noqa: BLE001 - 撤单尽力而为，不能挡住平仓
+                logger.warning("撤条件单失败 %s %s: %s", inst_id, algo_id, exc)
+        try:
+            self.request(
+                "DELETE",
+                "/fapi/v1/allOpenOrders",
+                params={"symbol": to_binance_symbol(inst_id)},
+            )
+        except Exception as exc:  # noqa: BLE001 - 同上
+            logger.warning("撤普通挂单失败 %s: %s", inst_id, exc)
+        return out
 
     def close_position(
         self, inst_id: str, mgn_mode: str = "cross", pos_side: str | None = None
@@ -1008,6 +1096,10 @@ class BinanceTrader:
         return notes
 
     def _has_stop_order(self, symbol: str) -> bool:
+        """该品种是否已有止损单（查 Algo 条件单，也兼容普通挂单里的止损）。"""
+        for row in self.client.algo_pending(inst_id=symbol):
+            if str(row.get("type", "")).upper() in ("STOP_MARKET", "STOP"):
+                return True
         for row in self.client.pending_orders(inst_id=symbol):
             if str(row.get("type", "")).upper() in ("STOP_MARKET", "STOP"):
                 return True

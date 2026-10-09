@@ -27,6 +27,9 @@ def settings_and_path(tmp_path):
     settings = Settings()
     cred_path = tmp_path / "okx_trading.json"
     settings.trading.credentials_path = str(cred_path)
+    # 币安凭据也必须指向临时目录：否则测试会去读开发者本机真实的
+    # config/binance_trading.json，输入框被真 key 填满，断言全部失真。
+    settings.trading.binance_credentials_path = str(tmp_path / "binance_trading.json")
     return settings, cred_path
 
 

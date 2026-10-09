@@ -92,7 +92,9 @@ def test_binance_to_canonical_symbol():
 @pytest.mark.parametrize("bad", ["BTC-USD-SWAP", "BTC-USDC-SWAP", "XAUUSDm", ""])
 def test_unsupported_symbol_rejected(bad):
     """只支持 USDT 本位永续；其他写法明确报错，不猜代码。"""
-    with pytest.raises(Exception):
+    from pa_agent.trading.gateway import TradeRejected
+
+    with pytest.raises(TradeRejected):
         to_binance_symbol(bad)
 
 
@@ -293,21 +295,86 @@ def test_realized_pnl_today_sums_three_income_types(monkeypatch):
 
 
 def test_stop_order_uses_close_position_then_falls_back(monkeypatch):
-    """closePosition 失败（比如没仓位）→ 自动退回 reduceOnly + 数量。"""
+    """closePosition 失败（比如没仓位，币安回 -4509）→ 自动退回 reduceOnly + 数量。
+
+    两者都必须走 **Algo Order API**：老接口会回 -4120。
+    """
     ok = (
-        '{"symbol":"BTCUSDT","orderId":7,"clientOrderId":"PAAGENT-S-1","side":"SELL",'
-        '"origQty":"0","price":"0","time":1,"type":"STOP_MARKET","stopPrice":"80000",'
-        '"status":"NEW","executedQty":"0"}'
+        '{"algoId":7,"clientAlgoId":"PAAGENT-S-1","symbol":"BTCUSDT","side":"SELL",'
+        '"orderType":"STOP_MARKET","triggerPrice":"80000","closePosition":"true",'
+        '"bookTime":1,"algoStatus":"NEW"}'
     )
-    err = '{"code":-2021,"msg":"Order would immediately trigger."}'
+    err = '{"code":-4509,"msg":"Time in Force (TIF) GTE can only be used with open positions."}'
     client, rec = _client(monkeypatch, [(200, '{"serverTime":1}'), (200, err), (200, ok)])
     row = client.place_stop(
         inst_id="BTC-USDT-SWAP", side="sell", stop_px=80000.0, size=0.5, tick=0.1, step=0.001
     )
     assert row["ordId"] == "7"
     first, second = rec.calls[-2]["url"], rec.calls[-1]["url"]
+    assert "/fapi/v1/algoOrder" in first and "/fapi/v1/order" not in first
+    assert "algoType=CONDITIONAL" in first
+    assert "triggerPrice=80000" in first          # 字段名是 triggerPrice，不是 stopPrice
     assert "closePosition=true" in first
     assert "reduceOnly=true" in second and "quantity=0.500" in second
+
+
+def test_algo_order_fields_are_translated(monkeypatch):
+    """Algo 单的字段名（algoId/triggerPrice/clientAlgoId/bookTime）翻译成统一字段。"""
+    rows = json.dumps([
+        {"algoId": 123456, "clientAlgoId": "PAAGENT-S-9", "symbol": "SOLUSDT",
+         "side": "SELL", "orderType": "STOP_MARKET", "triggerPrice": "108.72",
+         "quantity": "0", "closePosition": "true", "bookTime": 1700000000000,
+         "algoStatus": "NEW"},
+        {"algoId": 999, "clientAlgoId": "manual-x", "symbol": "SOLUSDT", "side": "BUY",
+         "orderType": "TAKE_PROFIT_MARKET", "triggerPrice": "120", "bookTime": 1,
+         "algoStatus": "NEW"},
+    ])
+    client, _ = _client(monkeypatch, [(200, '{"serverTime":1}'), (200, rows)])
+    out = client.algo_pending(inst_id="SOL-USDT-SWAP")
+    assert out[0]["instId"] == "SOL-USDT-SWAP"
+    assert out[0]["ordId"] == "123456"
+    assert out[0]["stopPx"] == 108.72 and out[0]["slTriggerPx"] == 108.72
+    assert out[0]["tag"] == "PAAGENT" and out[0]["type"] == "STOP_MARKET"
+    assert out[0]["cTime"] == 1700000000000
+    assert out[1]["tag"] == ""                     # 手动单不带标记
+
+
+def test_cancel_all_orders_cancels_algo_orders_too(monkeypatch):
+    """平仓时必须把 Algo 止损伤一起撤掉，否则会打掉下一次开的同品种仓位。"""
+    algo = json.dumps([{"algoId": 5, "clientAlgoId": "PAAGENT-S-1", "symbol": "SOLUSDT",
+                        "side": "SELL", "orderType": "STOP_MARKET", "triggerPrice": "1",
+                        "bookTime": 1, "algoStatus": "NEW"}])
+    client, rec = _client(
+        monkeypatch,
+        [(200, '{"serverTime":1}'),                    # sync_time
+         (200, algo),                                  # 列条件单
+         (200, '{"algoId":5,"clientAlgoId":"PAAGENT-S-1","symbol":"SOLUSDT"}'),  # 撤条件单
+         (200, '{"code":200,"msg":"The operation of cancel all open order is done."}')],
+    )
+    client.cancel_all_orders("SOL-USDT-SWAP")
+    urls = [c["url"] for c in rec.calls]
+    assert any("DELETE" == c["method"] and "/fapi/v1/algoOrder" in c["url"] for c in rec.calls)
+    assert any("/fapi/v1/allOpenOrders" in u for u in urls)
+
+
+def test_code_200_is_treated_as_success(monkeypatch):
+    """DELETE allOpenOrders 成功时返回 {"code":200,...}，不能当成错误。"""
+    client, _ = _client(
+        monkeypatch,
+        [(200, '{"serverTime":1}'),
+         (200, "[]"),                                  # 没有条件单
+         (200, '{"code":200,"msg":"The operation of cancel all open order is done."}')],
+    )
+    client.cancel_all_orders("SOL-USDT-SWAP")       # 不应该抛异常
+
+
+def test_equity_uses_account_endpoint(monkeypatch):
+    """/fapi/v2/balance 没有 totalMarginBalance，必须用 /fapi/v2/account。"""
+    acct = json.dumps({"totalMarginBalance": "1913.13", "totalWalletBalance": "1900",
+                       "availableBalance": "1500"})
+    client, rec = _client(monkeypatch, [(200, '{"serverTime":1}'), (200, acct)])
+    assert client.equity_usd() == pytest.approx(1913.13)
+    assert "/fapi/v2/account" in rec.calls[-1]["url"]
 
 
 # ── 4. 执行流程 ───────────────────────────────────────────────────────────────
@@ -318,11 +385,12 @@ class _FakeClient:
 
     def __init__(
         self, *, equity=2000.0, positions=None, pending=None, pnl=0.0,
-        dual=False, entry_status="NEW", entry_filled=0.0,
+        dual=False, entry_status="NEW", entry_filled=0.0, algo=None,
     ) -> None:
         self._equity = equity
         self._positions = list(positions or [])
         self._pending = list(pending or [])
+        self._algo = list(algo or [])
         self._pnl = pnl
         self._dual = dual
         self.entry_status = entry_status
@@ -343,6 +411,9 @@ class _FakeClient:
 
     def pending_orders(self, inst_id=None, inst_type=None):
         return list(self._pending)
+
+    def algo_pending(self, inst_id=None, ord_type="oco"):
+        return list(self._algo)
 
     def realized_pnl_today_usd(self, tz_offset_hours=8):
         return self._pnl
@@ -561,7 +632,8 @@ def test_ensure_stops_skips_when_stop_exists(monkeypatch, tmp_path):
     )
     client = _FakeClient(
         positions=[{"instId": "BTC-USDT-SWAP", "pos": 0.002}],
-        pending=[{"instId": "BTC-USDT-SWAP", "type": "STOP_MARKET", "tag": "PAAGENT"}],
+        algo=[{"instId": "BTC-USDT-SWAP", "type": "STOP_MARKET", "tag": "PAAGENT",
+               "ordId": "5"}],
     )
     trader = _trader(monkeypatch, tmp_path, client)
     assert trader.ensure_stops("BTC-USDT-SWAP") == []
