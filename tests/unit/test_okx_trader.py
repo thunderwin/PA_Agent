@@ -638,6 +638,34 @@ def test_cancel_stale_entries_unknown_timeframe_is_noop():
     assert client.cancelled == []
 
 
+# ── 已持仓/已挂单的品种（用于跳过分析）────────────────────────────────────────
+
+def _client_with(positions, pending) -> OkxPrivateClient:
+    """真实的 OkxPrivateClient，只把两个取数方法换成固定返回值（不发请求）。"""
+    client = OkxPrivateClient(OkxCredentials("ak", "sk", "pp", simulated=True))
+    client.positions = lambda inst_id=None, inst_type=None: list(positions)
+    client.pending_orders = lambda inst_id=None, inst_type="SWAP": list(pending)
+    return client
+
+
+def test_occupied_symbols_unions_positions_and_pending():
+    client = _client_with(
+        [{"instId": "BTC-USDT-SWAP", "pos": "-1.05"}],
+        [{"instId": "XAU-USDT-SWAP", "ordId": "1"}],
+    )
+    assert client.occupied_symbols() == {"BTC-USDT-SWAP", "XAU-USDT-SWAP"}
+
+
+def test_occupied_symbols_empty_when_flat():
+    client = _client_with([{"instId": "BTC-USDT-SWAP", "pos": "0"}], [])
+    assert client.occupied_symbols() == set()
+
+
+def test_occupied_symbols_ignores_empty_rows():
+    client = _client_with([{"instId": "", "pos": "2"}], [{"ordId": "9"}])
+    assert client.occupied_symbols() == set()
+
+
 def test_execute_blocked_when_disabled():
     trader, client, market = _trader(enabled=False)
     result = trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False)

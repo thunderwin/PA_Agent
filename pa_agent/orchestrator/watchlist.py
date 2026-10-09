@@ -54,6 +54,8 @@ class WatchResult:
     take_profit: float | None = None
     diagnosis: str = ""  # 周期位置 / 诊断摘要
     error: str = ""
+    #: 跳过分析的原因（如「已持仓」「已挂单」）——非空表示这一轮没有调用模型
+    skip_reason: str = ""
     #: 阶段二内层决策原文（自动下单要用，与主流程同一份结构）
     decision: dict = _field(default_factory=dict)
 
@@ -187,40 +189,120 @@ def analyze_target(
     return result
 
 
+_TRANSIENT_HINTS = (
+    "429", "rate limit", "rate_limit", "too many requests", "timeout", "timed out",
+    "connection", "network", "temporarily", "overload", "502", "503", "504",
+)
+
+
+def _looks_transient(error: str) -> bool:
+    """错误是否属于「重试一次可能成功」的瞬时问题（限流/超时/网络）。"""
+    text = str(error or "").lower()
+    return any(hint in text for hint in _TRANSIENT_HINTS)
+
+
 def run_watchlist(
     targets: Iterable[WatchTarget],
     *,
-    source: Any,
+    source: Any = None,
     make_orchestrator: Callable[[], Any],
     bar_count: int = 100,
     cancel_token: Any = None,
     on_result: Callable[[WatchResult], None] | None = None,
     previous_closed: dict[tuple[str, str], int] | None = None,
     gap_s: float = 0.0,
+    concurrency: int = 1,
+    source_factory: Callable[[], Any] | None = None,
+    skip_symbols: set[str] | None = None,
 ) -> dict[tuple[str, str], int]:
-    """按顺序把 *targets* 跑一遍；返回各品种最新已收盘 K 线时间戳。
+    """把 *targets* 跑一遍；返回各品种最新已收盘 K 线时间戳。
 
     ``previous_closed`` 传上一轮的结果即可实现「只在新 K 线收盘时分析」。
+
+    ``concurrency`` > 1 时用线程池并发分析（默认为 1 = 串行）。**并发时必须提供
+    ``source_factory``**：每个品种要拿自己的数据源实例，否则多个线程会互相覆盖
+    订阅（A 订阅 BTC、B 订阅 ETH 后，A 取数会拿到 ETH 的数据）。
+
+    ``skip_symbols`` 里的品种**直接跳过分析**（不取数、不调模型）——用于"已有持仓或
+    已有挂单"的品种：它们既不能再开新仓，分析结果也无法执行，白花 token。
     """
     state: dict[tuple[str, str], int] = dict(previous_closed or {})
-    for target in targets:
-        if cancel_token is not None and cancel_token.is_set():
-            break
+    target_list = list(targets)
+    workers = max(1, int(concurrency or 1))
+    skip = {str(s).strip().upper() for s in (skip_symbols or set())}
+
+    def _skip_result(target: WatchTarget) -> WatchResult:
+        return WatchResult(
+            symbol=target.symbol, timeframe=target.timeframe,
+            ts_ms=int(time.time() * 1000), skipped=True,
+            skip_reason="已持仓/已挂单，跳过分析",
+        )
+
+    def _run_owned(target: WatchTarget) -> WatchResult:
+        """跳过判断在取数之前——被跳过的品种不建数据源、不调模型。"""
+        if target.symbol.strip().upper() in skip:
+            return _skip_result(target)
+        own_source = source_factory() if source_factory is not None else source
+        return _run_one(target, own_source)
+
+    def _run_one(target: WatchTarget, own_source: Any) -> WatchResult:
+        if target.symbol.strip().upper() in skip:
+            return _skip_result(target)
         result = analyze_target(
             target,
-            source=source,
+            source=own_source,
             make_orchestrator=make_orchestrator,
             bar_count=bar_count,
             cancel_token=cancel_token,
             previous_closed_ts=state.get(target.key),
         )
+        # 并发时更容易撞上限流/超时；这类瞬时失败重试一次（间隔 5 秒）
+        if not result.ok and _looks_transient(result.error):
+            logger.info("watchlist 重试 %s：%s", target.symbol, result.error)
+            time.sleep(5.0)
+            result = analyze_target(
+                target,
+                source=own_source,
+                make_orchestrator=make_orchestrator,
+                bar_count=bar_count,
+                cancel_token=cancel_token,
+                previous_closed_ts=state.get(target.key),
+            )
+        return result
+
+    def _handle(result: WatchResult) -> None:
         if result.closed_ts is not None:
-            state[target.key] = result.closed_ts
+            state[result.symbol, result.timeframe] = result.closed_ts
         if on_result is not None:
             try:
                 on_result(result)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.debug("watchlist on_result failed: %s", exc)
-        if gap_s > 0:
-            time.sleep(gap_s)
+
+    if workers <= 1 or source_factory is None:
+        if source is None and source_factory is None:
+            raise ValueError("run_watchlist 需要 source 或 source_factory 之一")
+        for target in target_list:
+            if cancel_token is not None and cancel_token.is_set():
+                break
+            _handle(_run_owned(target))
+            if gap_s > 0:
+                time.sleep(gap_s)
+        return state
+
+    # ── 并发：每个 worker 一个独立数据源 ──────────────────────────────────────
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {}
+        for target in target_list:
+            if cancel_token is not None and cancel_token.is_set():
+                break
+            futures[pool.submit(_run_owned, target)] = target
+        for future in as_completed(futures):
+            try:
+                _handle(future.result())
+            except Exception as exc:  # noqa: BLE001
+                target = futures[future]
+                logger.warning("watchlist worker failed %s: %s", target.symbol, exc)
     return state

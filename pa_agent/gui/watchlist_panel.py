@@ -107,6 +107,8 @@ class WatchlistPanel(QWidget):
 
         if result.error:
             self._set(row, 7, result.error[:40], color=_COLOR_ERROR)
+        elif result.skip_reason:
+            self._set(row, 7, result.skip_reason, color=_COLOR_MUTED)
         elif result.skipped:
             self._set(row, 7, "无新K线", color=_COLOR_MUTED)
         else:

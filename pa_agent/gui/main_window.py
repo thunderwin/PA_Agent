@@ -270,6 +270,9 @@ class _WatchlistWorker(QThread):
         targets: list[tuple[str, str]],
         bar_count: int,
         interval_s: int,
+        concurrency: int,
+        skip_occupied: bool = False,
+        make_trader: Any = None,
         make_orchestrator: Any,
         parent: QObject | None = None,
     ) -> None:
@@ -278,6 +281,9 @@ class _WatchlistWorker(QThread):
         self._targets = list(targets)
         self._bar_count = int(bar_count)
         self._interval_s = max(int(interval_s), 10)
+        self._concurrency = max(1, int(concurrency))
+        self._skip_occupied = bool(skip_occupied)
+        self._make_trader = make_trader
         self._make_orchestrator = make_orchestrator
 
         from pa_agent.util.threading import CancelToken
@@ -287,44 +293,72 @@ class _WatchlistWorker(QThread):
     def stop(self) -> None:
         self._cancel_token.set()
 
+    def _occupied_symbols(self) -> set[str]:
+        """查询"已有持仓或有挂单"的品种；失败时返回空集合（不跳过任何品种）。"""
+        if self._make_trader is None:
+            return set()
+        try:
+            trader = self._make_trader()
+            return set(trader.client.occupied_symbols())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取持仓/挂单状态失败，本轮不跳过任何品种：%s", exc)
+            return set()
+
     def run(self) -> None:  # noqa: C901
         import time as _time
 
         from pa_agent.data.factory import create_data_source
         from pa_agent.orchestrator.watchlist import WatchTarget, run_watchlist
 
+        def _new_source() -> Any:
+            """每个品种一个独立数据源实例（并发时避免订阅互相覆盖）。"""
+            src = create_data_source(self._kind)
+            src.connect()
+            return src
+
         try:
-            source = create_data_source(self._kind)
-            source.connect()
-        except Exception as exc:  # noqa: BLE001
+            _new_source()          # 先探一次，数据源不可用就早点报错
+        except Exception as exc:   # noqa: BLE001
             self.status_update.emit(f"多品种监控无法启动：{exc}")
             return
 
         targets = [WatchTarget(symbol, timeframe) for symbol, timeframe in self._targets]
         previous: dict[tuple[str, str], int] = {}
-        try:
-            while not self._cancel_token.is_set():
-                self.status_update.emit(
-                    f"多品种监控：正在检查 {len(targets)} 个品种…"
-                )
-                previous = run_watchlist(
-                    targets,
-                    source=source,
-                    make_orchestrator=self._make_orchestrator,
-                    bar_count=self._bar_count,
-                    cancel_token=self._cancel_token,
-                    on_result=self.result_ready.emit,
-                    previous_closed=previous,
-                )
-                waited = 0.0
-                while waited < self._interval_s and not self._cancel_token.is_set():
-                    _time.sleep(0.5)
-                    waited += 0.5
-        finally:
-            try:
-                source.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
+        skip_symbols: set[str] = set()
+        logged_skip: set[str] = set()
+        while not self._cancel_token.is_set():
+            # 有持仓/有挂单的品种跳过分析（拿不到状态时按"不跳过"处理：
+            # 分析本身无害，真正的资金闸门在下单那一步）
+            if self._skip_occupied:
+                skip_symbols = self._occupied_symbols()
+                if skip_symbols != logged_skip:   # 只在集合变化时记一次，免得每轮刷屏
+                    logged_skip = set(skip_symbols)
+                    logger.warning(
+                        "多品种监控：跳过已持仓/已挂单的品种 %s（这一轮不分析它们）",
+                        sorted(skip_symbols) or "无",
+                    )
+            self.status_update.emit(
+                f"多品种监控：正在检查 {len(targets)} 个品种"
+                f"（周期 {self._targets[0][1] if self._targets else ''}"
+                f" · 并发 {self._concurrency}"
+                + (f" · 跳过 {len(skip_symbols)} 个已持仓/挂单" if skip_symbols else "")
+                + "）…"
+            )
+            previous = run_watchlist(
+                targets,
+                source_factory=_new_source,
+                concurrency=self._concurrency,
+                make_orchestrator=self._make_orchestrator,
+                bar_count=self._bar_count,
+                cancel_token=self._cancel_token,
+                on_result=self.result_ready.emit,
+                previous_closed=previous,
+                skip_symbols=skip_symbols,
+            )
+            waited = 0.0
+            while waited < self._interval_s and not self._cancel_token.is_set():
+                _time.sleep(0.5)
+                waited += 0.5
 
 
 class MainWindow(QMainWindow):
@@ -4465,6 +4499,12 @@ class MainWindow(QMainWindow):
         tf = str(getattr(general, "watch_timeframe", "") or "")
         return tf or self._tf_combo.currentText()
 
+    def _make_okx_trader(self) -> Any:
+        """按当前设置造一个 OKX 执行器（只用来读持仓/挂单状态）。"""
+        from pa_agent.trading.okx_trader import OkxTrader
+
+        return OkxTrader.from_settings(self._ctx.settings)
+
     def _watchlist_targets(self) -> list[Any]:
         from pa_agent.orchestrator.watchlist import WatchTarget
 
@@ -4537,6 +4577,7 @@ class MainWindow(QMainWindow):
         panel.set_targets(targets)
         panel.set_status_text(
             f"监控中：{len(targets)} 个品种 · 周期 {targets[0].timeframe} · "
+            f"并发 {int(getattr(general, 'watch_concurrency', 1) or 1)} · "
             f"每 {int(getattr(general, 'watch_interval_s', 60))} 秒探活一次"
         )
         worker = _WatchlistWorker(
@@ -4544,6 +4585,9 @@ class MainWindow(QMainWindow):
             targets=[(t.symbol, t.timeframe) for t in targets],
             bar_count=int(getattr(general, "analysis_bar_count", 100) or 100),
             interval_s=int(getattr(general, "watch_interval_s", 60) or 60),
+            concurrency=int(getattr(general, "watch_concurrency", 1) or 1),
+            skip_occupied=bool(getattr(general, "watch_skip_occupied", True)),
+            make_trader=self._make_okx_trader,
             make_orchestrator=self._build_orchestrator,
             parent=None,
         )
@@ -4632,13 +4676,21 @@ class MainWindow(QMainWindow):
         def _run() -> None:
             from pa_agent.trading.okx_trader import OkxTrader
 
-            try:
-                trader = OkxTrader.from_settings(settings)
-                outcome: Any = trader.execute(
-                    decision, symbol=symbol, dry_run=False, manual_confirm=False
-                )
-            except Exception as exc:  # noqa: BLE001
-                outcome = exc
+            import threading
+
+            lock = getattr(self, "_auto_trade_lock", None)
+            if lock is None:
+                lock = self._auto_trade_lock = threading.Lock()
+            # 并发分析时，多个品种可能同时到达这里；对「持仓上限检查 + 下单」
+            # 加锁串行化，避免同时通过上限检查而超额开仓。
+            with lock:
+                try:
+                    trader = OkxTrader.from_settings(settings)
+                    outcome: Any = trader.execute(
+                        decision, symbol=symbol, dry_run=False, manual_confirm=False
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    outcome = exc
             self.trade_finished.emit(outcome)
 
         threading.Thread(target=_run, name=f"okx-auto-{symbol}", daemon=True).start()

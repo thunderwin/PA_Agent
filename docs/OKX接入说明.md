@@ -95,7 +95,7 @@ OKX 每行 K 线是 `[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]`，程�
 
 ### 6.0 当前监控品种（2026-10-08 实测核实）
 
-`general.watch_symbols`（10 个，`general.watch_timeframe = 30m`）：
+`general.watch_symbols`（10 个，`general.watch_timeframe = 1h`）：
 
 | 品种 | 定位 | 对 BTC | 对现有组合平均相关 | 价差 | 24h 名义额 |
 |------|------|-------|-----------------|------|-----------|
@@ -112,10 +112,29 @@ OKX 每行 K 线是 `[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]`，程�
 
 依据 = **对现有组合的平均相关性低 + 买卖价差小 + 流动性够**（相关性用 30 天小时收益率实测）。
 
-**周期为什么是 30m（2026-10-08 13:14 改的）**：一轮 10 个品种的分析要 20–30 分钟
-（实测同一品种连续两次分析的间隔为 27 / 29 / 31 分钟），15 分钟一根 K 线根本来不及。
-注意 **30m 也已经跑满**（一轮 ≈ 29–31 分钟 vs 30 分钟），模型一变慢就会滞后；
-要留余量可选 **1h**，或者把品种收敛到 4–5 个后再回到 15m。
+**周期为什么是 1h（2026-10-09 改的）**：串行一轮 10 个品种要 20–30 分钟（单个品种一次
+两阶段分析约 2–3 分钟，thinking=high），15m/30m 都跑不满。改法有两条，现在两条都用了：
+
+1. **并发分析**（`general.watch_concurrency`，当前 10）：每个品种一个独立数据源实例并发跑。
+   **必须每品种一个数据源**——共用一个实例时后订阅的会覆盖前一个的订阅，A 拿到 B 的 K 线。
+   并发下撞到限流/超时（429/超时/网络）会**间隔 5 秒重试一次**。
+2. **周期 1h**：2026-10-09 08:47 实测一轮（并发 10、跳过 6 个，实际分析 4 个品种）
+   从 08:47:57 到 08:50:23 约 **2.5 分钟**，1 小时一根 K 线余量充足。
+
+**已持仓 / 已挂单的品种不再分析（2026-10-09 新增）**：`general.watch_skip_occupied`（当前 `true`）。
+每轮开始先查一次 OKX 的**持仓**和**未成交挂单**，命中的品种直接跳过——不取数、不调模型。
+理由：这类品种既不能再开新仓，分析结果也没法执行，纯烧 token。
+2026-10-09 08:49 实测：10 个品种里 6 个（AAPL / BTC / NG / NVDA / TSLA / XAU）被跳过，
+只落了 4 份分析记录（CL / AMZN / GOOGL / META），跳过集合变化时日志记一行
+（`多品种监控：跳过已持仓/已挂单的品种 [...]`）。查不到持仓状态时**按不跳过处理**——
+分析本身无害，真正的资金闸门在下单那一步。
+
+> **日志级别陷阱（2026-10-09 核实）**：`logs/pa_agent.log` 里**看不到 INFO 记录**，
+> 因为上游 `pa_agent/util/logging.py` 的 `_QUIET_LOGGER_NAMES` 里写了 `"root"`，
+> 而 Python 的 `logging.getLogger("root")` **返回的就是真正的根 logger**——
+> 结果整个根 logger 被 `setLevel(WARNING)`。
+> 所以程序里所有 `logger.info()` 都进不了文件。本次没动这行上游代码（"原始代码尽量不改"），
+> 监控相关的日志改用 WARNING 级别输出；要彻底修掉就把 `"root"` 从静音名单里删掉。
 
 **为什么不加这几个**（2026-10-08 实测）：
 
@@ -138,6 +157,23 @@ OKX 每行 K 线是 `[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]`，程�
 凭据写到 `config/okx_trading.json`（已 gitignore，权限 600）；模拟盘/实盘、风控参数写到
 `config/settings.json` 的 `trading` 段。也可以用环境变量 `OKX_API_KEY` / `OKX_SECRET_KEY` /
 `OKX_PASSPHRASE`，优先级高于文件。
+
+**当前生效的监控/风控设置**（2026-10-09 核对 `config/settings.json`）：
+
+| 项 | 值 |
+|----|----|
+| `general.watch_timeframe` | `1h` |
+| `general.watch_concurrency` | `10`（并发分析线程数） |
+| `general.watch_skip_occupied` | `true`（已持仓/已挂单的品种跳过分析） |
+| `general.watch_interval_s` | `60`（探活间隔；只有新 K 线收盘才真正调模型） |
+| `trading.simulated` | `false`（实盘） |
+| `trading.trigger_mode` | `auto`（自动下单，不弹确认框） |
+| `trading.max_loss_per_trade_usd` | `2`（每笔止损最大亏损） |
+| `trading.leverage` | `10`（全仓） |
+| `trading.max_open_positions` | `8` |
+| `trading.min_confidence` | `50` |
+| `trading.attach_take_profit` | `false`（止盈手动） |
+| `trading.pending_entry_expiry_bars` | `2`（= 2 根 1h = 2 小时） |
 
 ### 6.2 以损定量（核心）
 
@@ -172,15 +208,19 @@ OKX 每行 K 线是 `[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]`，程�
 - 总开关未开 / 没有 API 凭据
 - 实盘但未勾选「实盘风险确认」
 - 决策不是限价单/突破单/市价单，或缺少止损价
-- 置信度 `trade_confidence` 低于设置门槛（默认 60）
+- 置信度 `trade_confidence` 低于设置门槛（代码默认 60，**当前设置 50**）
 - 同时持仓数达到上限（**当前 8**；2026-10-08 之前是 4 —— 日志里出现过大量
   `持仓数 4 已达上限 4`，导致排在后面的品种抢不到名额，因此上调）
 - 持仓品种不在允许列表内
 - 当日已实现亏损达到上限（默认 30 USDT）——读的是 OKX 账单，读失败时按保守策略拒单
-- **入场挂单过期自动撤销**（`trading.pending_entry_expiry_bars`，默认 8）：
-  等待回撤的限价单超过 8 根监控周期的 K 线仍未成交，就自动撤掉，避免形态早已改变
+- **入场挂单过期自动撤销**（`trading.pending_entry_expiry_bars`，默认 8，**当前 2**）：
+  等待回撤的限价单超过这么多根监控周期的 K 线仍未成交，就自动撤掉，避免形态早已改变
   却还被"自动接刀"。**只撤程序自己下的单**——所有程序订单都带 `tag=PAAGENT`
   （`okx_trader.ORDER_TAG`），你手动挂的单不会被碰。
+  ⚠️ 这个数字是按**K 线根数**算的（`timeframe_to_seconds × 根数`），**周期一改含义就变**：
+  15m 时代的 8 根 = 2 小时；2026-10-09 周期改成 1h 后，8 根会变成 8 小时，因此同步改成
+  **2 根 = 2 小时**，保持原来的"挂 2 小时不成交就撤"意图。
+  查挂单失败时**跳过清理**（不会误撤），报错只记日志。
 
 ### 6.5 谁会平仓：程序只开仓，不平仓
 

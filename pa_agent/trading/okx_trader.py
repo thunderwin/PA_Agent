@@ -344,6 +344,31 @@ class OkxPrivateClient:
         rows = self.positions(inst_type=inst_type)
         return sum(1 for r in rows if abs(_as_float(r.get("pos")) or 0.0) > 0)
 
+    def occupied_symbols(self, inst_type: str = "SWAP") -> set[str]:
+        """已有持仓**或**有未成交挂单的品种集合。
+
+        这些品种既不能再开新仓，也没有必要再花 token 分析（结果无法执行）。
+        """
+        out: set[str] = set()
+        try:
+            for row in self.positions(inst_type=inst_type):
+                if abs(_as_float(row.get("pos")) or 0.0) > 0:
+                    inst = str(row.get("instId") or "").strip().upper()
+                    if inst:
+                        out.add(inst)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取持仓失败（跳过分析判断将不做）: %s", exc)
+            raise
+        try:
+            for row in self.pending_orders(inst_type=inst_type):
+                inst = str(row.get("instId") or "").strip().upper()
+                if inst:
+                    out.add(inst)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取挂单失败（跳过分析判断将不做）: %s", exc)
+            raise
+        return out
+
     def realized_pnl_today_usd(self, tz_offset_hours: int = 8) -> float:
         """当日（默认 UTC+8）已实现盈亏 + 手续费，用于日亏熔断。"""
         start = _day_start_ms(tz_offset_hours)

@@ -106,6 +106,10 @@ class GeneralSettings(BaseModel):
     watch_timeframe: str = ""
     #: 探活间隔（秒）：每次检查各品种有没有新 K 线收盘（只有收盘才真正调模型）
     watch_interval_s: int = Field(default=60, ge=10, le=3600)
+    #: 多品种并发分析线程数（1 = 串行）。并发时每个品种用独立数据源实例。
+    watch_concurrency: int = Field(default=3, ge=1, le=20)
+    #: 已有持仓或已有挂单的品种跳过分析（它们的结论无法执行，白花 token）
+    watch_skip_occupied: bool = True
     #: 监控到可下单方案时播放提示音并提示
     watch_alert_on_signal: bool = True
     #: 重试后取消持续跟踪分析：校验失败触发重试后自动关闭 keep_analysis

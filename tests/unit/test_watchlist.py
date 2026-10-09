@@ -238,6 +238,116 @@ def test_run_watchlist_respects_cancel_token():
     assert results == []
 
 
+# ── 并发 ──────────────────────────────────────────────────────────────────────
+
+def test_run_watchlist_concurrent_uses_one_source_per_target():
+    """并发时每个品种必须用自己的数据源，否则订阅会互相覆盖。"""
+    targets = [
+        WatchTarget("BTC-USDT-SWAP", "15m"),
+        WatchTarget("ETH-USDT-SWAP", "15m"),
+        WatchTarget("XAU-USDT-SWAP", "15m"),
+    ]
+    bars = _bars()
+    sources: list[_FakeSource] = []
+
+    def factory() -> _FakeSource:
+        src = _FakeSource(bars)
+        sources.append(src)
+        return src
+
+    results: list[WatchResult] = []
+    run_watchlist(
+        targets, source_factory=factory, concurrency=3,
+        make_orchestrator=_FakeOrchestrator, on_result=results.append,
+    )
+
+    assert len(sources) == 3                       # 每个品种一个实例
+    assert len(results) == 3
+    # 每个数据源只订阅了一个品种（说明没有共用同一个实例被打乱）
+    assert sorted(s.subscribed[0][0] for s in sources) == [
+        "BTC-USDT-SWAP", "ETH-USDT-SWAP", "XAU-USDT-SWAP",
+    ]
+
+
+def test_run_watchlist_concurrent_retries_transient(monkeypatch):
+    """并发下的限流/超时类错误会重试一次。"""
+    from pa_agent.orchestrator import watchlist as wl
+
+    monkeypatch.setattr(wl.time, "sleep", lambda _s: None)   # 跳过重试等待
+
+    class _FlakyOrch:
+        calls = 0
+
+        def submit(self, frame, cancel_token, on_event):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                raise RuntimeError("429 Too Many Requests")
+            return _FakeOrchestrator().submit(frame, cancel_token, on_event)
+
+    results: list[WatchResult] = []
+    run_watchlist(
+        [_target()], source_factory=lambda: _FakeSource(_bars()), concurrency=2,
+        make_orchestrator=_FlakyOrch, on_result=results.append,
+    )
+    assert _FlakyOrch.calls == 2                   # 失败一次 + 重试一次
+    assert results and results[0].ok is True
+
+
+def test_run_watchlist_skips_occupied_symbols():
+    """有持仓/有挂单的品种直接跳过分析：不取数、不调模型。"""
+    targets = [WatchTarget("BTC-USDT-SWAP", "1h"), WatchTarget("XAU-USDT-SWAP", "1h")]
+    orch = _FakeOrchestrator()
+    sources: list[_FakeSource] = []
+
+    def factory() -> _FakeSource:
+        src = _FakeSource(_bars())
+        sources.append(src)
+        return src
+
+    results: list[WatchResult] = []
+    run_watchlist(
+        targets, source_factory=factory, concurrency=2,
+        make_orchestrator=lambda: orch, on_result=results.append,
+        skip_symbols={"BTC-USDT-SWAP"},
+    )
+
+    by_symbol = {r.symbol: r for r in results}
+    assert by_symbol["BTC-USDT-SWAP"].skipped is True
+    assert "已持仓" in by_symbol["BTC-USDT-SWAP"].skip_reason
+    assert by_symbol["XAU-USDT-SWAP"].ok is True
+    assert len(orch.frames) == 1                   # 只分析了没被跳过的那个
+    assert [s.subscribed for s in sources if s.subscribed] == [[("XAU-USDT-SWAP", "1h")]]
+
+
+def test_run_watchlist_concurrency_one_with_factory_uses_source():
+    """并发数=1（串行）也必须能只靠 source_factory 跑通。"""
+    targets = [WatchTarget("BTC-USDT-SWAP", "1h"), WatchTarget("XAU-USDT-SWAP", "1h")]
+    results: list[WatchResult] = []
+    run_watchlist(
+        targets, source_factory=lambda: _FakeSource(_bars()), concurrency=1,
+        make_orchestrator=_FakeOrchestrator, on_result=results.append,
+    )
+    assert [r.ok for r in results] == [True, True]
+
+
+def test_run_watchlist_skipped_target_builds_no_source():
+    """被跳过的品种连数据源都不该建（不浪费一次取数）。"""
+    targets = [WatchTarget("BTC-USDT-SWAP", "1h"), WatchTarget("XAU-USDT-SWAP", "1h")]
+    built: list[str] = []
+
+    def factory() -> _FakeSource:
+        src = _FakeSource(_bars())
+        built.append("built")
+        return src
+
+    run_watchlist(
+        targets, source_factory=factory, concurrency=1,
+        make_orchestrator=_FakeOrchestrator,
+        skip_symbols={"BTC-USDT-SWAP"},
+    )
+    assert len(built) == 1                          # 只有没被跳过的那个建了数据源
+
+
 # ── 面板 / 对话框 ─────────────────────────────────────────────────────────────
 
 
