@@ -348,6 +348,53 @@ def test_run_watchlist_skipped_target_builds_no_source():
     assert len(built) == 1                          # 只有没被跳过的那个建了数据源
 
 
+def test_run_watchlist_retries_transient_source_failure(monkeypatch):
+    """**建数据源**时的超时也要重试（不只是"分析返回错误结果"）。
+
+    2026-10-09 实盘踩到：BinanceSource.connect() 的 ping 超时直接冒到线程池，
+    被记成 `watchlist worker failed` —— 那一轮白跑，而且没走重试。
+    """
+    from pa_agent.orchestrator import watchlist as wl
+
+    monkeypatch.setattr(wl.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def factory() -> _FakeSource:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("币安接口连接失败：Read timed out")
+        return _FakeSource(_bars())
+
+    results: list[WatchResult] = []
+    run_watchlist(
+        [_target()], source_factory=factory, concurrency=2,
+        make_orchestrator=_FakeOrchestrator, on_result=results.append,
+    )
+    assert calls["n"] == 2                          # 失败一次 + 重试一次
+    assert results and results[0].ok is True
+
+
+def test_run_watchlist_records_non_transient_failure_without_retry(monkeypatch):
+    """非瞬时错误（如品种不存在）不重试，但也绝不能让异常冒出去。"""
+    from pa_agent.orchestrator import watchlist as wl
+
+    monkeypatch.setattr(wl.time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def factory() -> _FakeSource:
+        calls["n"] += 1
+        raise ValueError("品种代码非法")
+
+    results: list[WatchResult] = []
+    run_watchlist(
+        [_target()], source_factory=factory, concurrency=1,
+        make_orchestrator=_FakeOrchestrator, on_result=results.append,
+    )
+    assert calls["n"] == 1                          # 不重试
+    assert results and results[0].ok is False       # 但结果里带上了错误
+    assert "品种代码非法" in results[0].error
+
+
 # ── 面板 / 对话框 ─────────────────────────────────────────────────────────────
 
 

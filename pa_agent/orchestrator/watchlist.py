@@ -238,29 +238,27 @@ def run_watchlist(
             skip_reason="已持仓/已挂单，跳过分析",
         )
 
-    def _run_owned(target: WatchTarget) -> WatchResult:
-        """跳过判断在取数之前——被跳过的品种不建数据源、不调模型。"""
-        if target.symbol.strip().upper() in skip:
-            return _skip_result(target)
-        own_source = source_factory() if source_factory is not None else source
-        return _run_one(target, own_source)
-
-    def _run_one(target: WatchTarget, own_source: Any) -> WatchResult:
-        if target.symbol.strip().upper() in skip:
-            return _skip_result(target)
-        result = analyze_target(
-            target,
-            source=own_source,
-            make_orchestrator=make_orchestrator,
-            bar_count=bar_count,
-            cancel_token=cancel_token,
-            previous_closed_ts=state.get(target.key),
+    def _error_result(target: WatchTarget, exc: BaseException) -> WatchResult:
+        """把异常转成"带 error 的结果"，好让它走统一的重试判断。"""
+        return WatchResult(
+            symbol=target.symbol,
+            timeframe=target.timeframe,
+            ts_ms=int(time.time() * 1000),
+            error=str(exc) or exc.__class__.__name__,
         )
-        # 并发时更容易撞上限流/超时；这类瞬时失败重试一次（间隔 5 秒）
-        if not result.ok and _looks_transient(result.error):
-            logger.info("watchlist 重试 %s：%s", target.symbol, result.error)
-            time.sleep(5.0)
-            result = analyze_target(
+
+    def _attempt(target: WatchTarget) -> WatchResult:
+        """建数据源 → 取数 → 分析；**任何异常都转成结果**，绝不向上抛。
+
+        2026-10-09 修：原来只有"分析返回错误结果"会重试，而数据源创建
+        （``connect()`` 里的连通性探测）抛出的超时会直接冒到线程池，
+        被记成 `watchlist worker failed` 就没了——那一轮白跑，也不重试。
+        """
+        if target.symbol.strip().upper() in skip:
+            return _skip_result(target)
+        try:
+            own_source = source_factory() if source_factory is not None else source
+            return analyze_target(
                 target,
                 source=own_source,
                 make_orchestrator=make_orchestrator,
@@ -268,6 +266,17 @@ def run_watchlist(
                 cancel_token=cancel_token,
                 previous_closed_ts=state.get(target.key),
             )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("watchlist 分析失败 %s: %s", target.symbol, exc)
+            return _error_result(target, exc)
+
+    def _run_owned(target: WatchTarget) -> WatchResult:
+        """跑一个品种，瞬时失败（限流/超时/网络）**整体重试一次**（间隔 5 秒）。"""
+        result = _attempt(target)
+        if result.error and _looks_transient(result.error):
+            logger.info("watchlist 重试 %s：%s", target.symbol, result.error)
+            time.sleep(5.0)
+            result = _attempt(target)
         return result
 
     def _handle(result: WatchResult) -> None:
