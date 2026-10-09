@@ -168,6 +168,7 @@ OKX 每行 K 线是 `[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]`，程�
 | 项 | 值 |
 |----|----|
 | `trading.venue` | `okx`（`binance` = 换币安下单，见 [交易网关说明](交易网关说明.md)） |
+| `general.watch_dynamic_enabled` | `true`（每小时按成交量突变换榜，见 [动态选币说明](动态选币说明.md)） |
 | `general.watch_timeframe` | `1h` |
 | `general.watch_concurrency` | `10`（并发分析线程数） |
 | `general.watch_skip_occupied` | `true`（已持仓/已挂单的品种跳过分析） |

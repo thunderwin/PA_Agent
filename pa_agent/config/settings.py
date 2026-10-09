@@ -9,6 +9,7 @@ DataSourceKind = Literal[
     "mt5",
     "tradingview",
     "okx",
+    "binance",
     "akshare",
     "eastmoney",
     "eastmoney_futures",
@@ -110,6 +111,21 @@ class GeneralSettings(BaseModel):
     watch_concurrency: int = Field(default=3, ge=1, le=20)
     #: 已有持仓或已有挂单的品种跳过分析（它们的结论无法执行，白花 token）
     watch_skip_occupied: bool = True
+    #: 动态选币：每小时按"成交量突变"重选品种，替换监控列表（见 orchestrator/screener.py）
+    watch_dynamic_enabled: bool = False
+    #: 每轮选几个（用户要的是 2 个）
+    watch_dynamic_count: int = Field(default=2, ge=1, le=20)
+    #: 多久重选一次（分钟）
+    watch_dynamic_refresh_min: int = Field(default=60, ge=5, le=1440)
+    #: True = 保留静态列表并**追加**选出来的（默认 False = 整个换掉）
+    watch_dynamic_keep_static: bool = False
+    #: 选币门槛：24h 成交额区间（USDT）
+    watch_dynamic_min_volume_usd: float = Field(default=2_000_000.0, gt=0)
+    watch_dynamic_max_volume_usd: float = Field(default=400_000_000.0, gt=0)
+    #: 选币门槛：突变强度（稳健 z 分数）
+    watch_dynamic_min_burst: float = Field(default=6.0, gt=0)
+    #: 选币时额外排除的品种（规范写法）
+    watch_dynamic_exclude: list[str] = Field(default_factory=list)
     #: 监控到可下单方案时播放提示音并提示
     watch_alert_on_signal: bool = True
     #: 重试后取消持续跟踪分析：校验失败触发重试后自动关闭 keep_analysis

@@ -206,3 +206,26 @@ def test_dialog_binance_requires_two_fields(qapp, settings_and_path, monkeypatch
     dlg._on_save()
     assert warnings and "币安" in warnings[0]
     assert settings.trading.enabled is False
+
+
+def test_dialog_backs_up_existing_credentials_before_overwrite(
+    qapp, settings_and_path, monkeypatch
+):
+    """写凭据前必须先备份：2026-10-09 有过一次自动化脚本把真实 key 写坏的事故。"""
+    settings, cred_path = settings_and_path
+    cred_path.write_text(
+        json.dumps({"api_key": "old-key", "secret_key": "old-secret", "passphrase": "old-pp"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dialog_mod, "save_settings", lambda s, p=None: None)
+
+    dlg = OkxTradingDialog(settings)
+    _fill_credentials(dlg)
+    dlg._enabled_check.setChecked(True)
+    dlg._demo_radio.setChecked(True)
+    dlg._on_save()
+
+    backup = cred_path.with_name(cred_path.name + ".bak")
+    assert backup.exists(), "覆盖前没有留下备份"
+    assert json.loads(backup.read_text(encoding="utf-8"))["api_key"] == "old-key"
+    assert json.loads(cred_path.read_text(encoding="utf-8"))["api_key"] == "ak-test"

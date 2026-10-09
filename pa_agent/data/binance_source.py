@@ -45,6 +45,8 @@ BINANCE_FAPI_URL: str = os.environ.get(
 
 #: 单次 klines 请求最多 1500 根。
 _MAX_KLINES_LIMIT = 1500
+#: 默认品种（与 OKX 用同一套规范写法）。
+BINANCE_DEFAULT_SYMBOL = "BTC-USDT-SWAP"
 _SNAPSHOT_CACHE_TTL_S = 1.5
 _INSTRUMENTS_CACHE_TTL_S = 600.0
 _TICKERS_CACHE_TTL_S = 60.0
@@ -346,6 +348,44 @@ class BinanceSource(DataSource):
             "ctVal": 1.0,             # 币安按标的币数量下单，等价于 ctVal=1
             "ctValCcy": str(row.get("baseAsset") or ""),
         }
+
+    def book_ticker(self, inst_id: str) -> tuple[float, float]:
+        """该品种的 ``(买一, 卖一)``；选币用点差过滤时需要（可选能力）。"""
+        canonical = normalize_binance_symbol(inst_id)
+        if not canonical:
+            raise DataSourceError(f"币安品种无效: {inst_id!r}")
+        payload = _http_get_json(
+            "/fapi/v1/ticker/bookTicker", {"symbol": f"{canonical.split('-')[0]}USDT"}
+        )
+        return _to_float((payload or {}).get("bidPrice")), _to_float((payload or {}).get("askPrice"))
+
+    def book_tickers(self) -> dict[str, float]:
+        """全市场点差（规范写法 → bp），一次请求拿全 —— 选币用这个，别逐币查。"""
+        rows = _http_get_json("/fapi/v1/ticker/bookTicker") or []
+        out: dict[str, float] = {}
+        for row in rows:
+            symbol = str((row or {}).get("symbol") or "")
+            if not symbol.endswith("USDT") or len(symbol) <= 4:
+                continue
+            bid = _to_float(row.get("bidPrice"))
+            ask = _to_float(row.get("askPrice"))
+            if bid > 0 and ask > 0 and ask >= bid:
+                out[f"{symbol[:-4]}-USDT-SWAP"] = (ask - bid) / ((ask + bid) / 2.0) * 1e4
+        return out
+
+    def volumes_24h(self) -> dict[str, float]:
+        """全市场 24h USDT 名义成交额（规范写法 → 金额），一次请求拿全。
+
+        选币时先用它做一遍粗筛，能把"评估 497 个币"压到只评估有量的那些，
+        全量扫描从 ~3 分钟降到 1 分钟出头。
+        """
+        rows = _http_get_json("/fapi/v1/ticker/24hr") or []
+        out: dict[str, float] = {}
+        for row in rows:
+            symbol = str((row or {}).get("symbol") or "")
+            if symbol.endswith("USDT") and len(symbol) > 4:
+                out[f"{symbol[:-4]}-USDT-SWAP"] = _to_float(row.get("quoteVolume"))
+        return out
 
     # ── Subscription ──────────────────────────────────────────────────────────
 

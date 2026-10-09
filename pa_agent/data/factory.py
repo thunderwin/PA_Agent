@@ -9,6 +9,7 @@ from pa_agent.data.market_defaults import (
     GOLD_MT5_SYMBOL,
     GOLD_TV_SYMBOL,
 )
+from pa_agent.data.binance_source import BINANCE_DEFAULT_SYMBOL
 from pa_agent.data.okx_source import OKX_DEFAULT_SYMBOL
 
 DataSourceKind = Literal[
@@ -40,7 +41,7 @@ _DEFAULT_SYMBOLS: dict[DataSourceKind, str] = {
     "mt5": GOLD_MT5_SYMBOL,
     "tradingview": GOLD_TV_SYMBOL,
     "okx": OKX_DEFAULT_SYMBOL,
-    "binance": OKX_DEFAULT_SYMBOL,   # 两个交易所共用同一套品种写法
+    "binance": BINANCE_DEFAULT_SYMBOL,   # 两个交易所共用同一套品种写法
     "akshare": A_SHARE_DEFAULT_SYMBOL,
     "eastmoney": A_SHARE_DEFAULT_SYMBOL,
     "eastmoney_futures": "RB0 螺纹钢",

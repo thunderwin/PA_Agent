@@ -106,6 +106,11 @@ def normalize_gold_symbol_for_kind(kind: str, symbol: str) -> str:
         from pa_agent.data.okx_source import OKX_DEFAULT_SYMBOL, normalize_okx_symbol
 
         return normalize_okx_symbol(sym) or OKX_DEFAULT_SYMBOL
+    if kind == "binance":
+        # 币安同理：只认 USDT 本位永续（规范写法与 OKX 相同）。
+        from pa_agent.data.binance_source import BINANCE_DEFAULT_SYMBOL, normalize_binance_symbol
+
+        return normalize_binance_symbol(sym) or BINANCE_DEFAULT_SYMBOL
     if kind in ("akshare", "eastmoney", "tushare"):
         code = normalize_ashare_symbol(sym)
         if not code or not _looks_like_ashare_code(code):

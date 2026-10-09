@@ -253,7 +253,7 @@ class _AnalysisWorker(QThread):
 
 #: 支持多品种后台监控的数据源（REST 型，能安全地再建一个实例）
 _WATCHLIST_KINDS: frozenset[str] = frozenset(
-    {"okx", "eastmoney", "eastmoney_futures", "yfinance", "akshare", "tushare"}
+    {"okx", "binance", "eastmoney", "eastmoney_futures", "yfinance", "akshare", "tushare"}
 )
 
 
@@ -262,6 +262,7 @@ class _WatchlistWorker(QThread):
 
     result_ready = pyqtSignal(object)   # WatchResult
     status_update = pyqtSignal(str)
+    targets_changed = pyqtSignal(object)   # list[tuple[symbol, timeframe]]（动态选币换榜时）
 
     def __init__(
         self,
@@ -273,6 +274,11 @@ class _WatchlistWorker(QThread):
         concurrency: int,
         skip_occupied: bool = False,
         make_trader: Any = None,
+        dynamic: bool = False,
+        dynamic_count: int = 2,
+        dynamic_refresh_min: int = 60,
+        dynamic_keep_static: bool = False,
+        screen_cfg: Any = None,
         make_orchestrator: Any,
         parent: QObject | None = None,
     ) -> None:
@@ -284,7 +290,14 @@ class _WatchlistWorker(QThread):
         self._concurrency = max(1, int(concurrency))
         self._skip_occupied = bool(skip_occupied)
         self._make_trader = make_trader
+        self._dynamic = bool(dynamic)
+        self._dynamic_count = max(int(dynamic_count), 1)
+        self._dynamic_refresh_s = max(int(dynamic_refresh_min), 5) * 60
+        self._dynamic_keep_static = bool(dynamic_keep_static)
+        self._screen_cfg = screen_cfg
+        self._static_targets = list(targets)
         self._make_orchestrator = make_orchestrator
+        self._last_refresh: float = 0.0        # 0 = 第一轮就重选一次
 
         from pa_agent.util.threading import CancelToken
 
@@ -304,6 +317,50 @@ class _WatchlistWorker(QThread):
             logger.warning("读取持仓/挂单状态失败，本轮不跳过任何品种：%s", exc)
             return set()
 
+    def _refresh_targets(self, new_source: Any, skip: set[str]) -> None:
+        """动态选币：用"成交量突变"重选标的，替换监控列表。
+
+        选币要拉全市场 K 线（约 1～3 分钟），跑在本线程里，不阻塞界面。
+        失败时**沿用上一轮标的**，不会把监控列表清空。
+        """
+        from pa_agent.orchestrator.screener import pick_symbols
+
+        if self._screen_cfg is None:
+            return
+        source = None
+        try:
+            source = new_source()
+            picked = pick_symbols(
+                source, self._screen_cfg, count=self._dynamic_count, exclude=set(skip)
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("动态选币失败，沿用上一轮标的：%s", exc)
+            return
+        finally:
+            if source is not None:
+                try:
+                    source.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        timeframe = self._targets[0][1] if self._targets else "1h"
+        symbols = [c.symbol for c in picked]
+        if self._dynamic_keep_static:
+            base = [s for s, _ in self._static_targets]
+            symbols = base + [s for s in symbols if s not in base]
+        if not symbols:
+            logger.warning("动态选币本轮没有挑到标的，沿用上一轮")
+            return
+        self._targets = [(s, timeframe) for s in symbols]
+        logger.warning(
+            "动态选币换榜：%s%s",
+            symbols,
+            "（" + "；".join(f"{c.symbol} 突变{c.burst:.0f} 放大{c.ratio:.1f}x" for c in picked) + "）"
+            if picked
+            else "",
+        )
+        self.targets_changed.emit(list(self._targets))
+
     def run(self) -> None:  # noqa: C901
         import time as _time
 
@@ -322,7 +379,6 @@ class _WatchlistWorker(QThread):
             self.status_update.emit(f"多品种监控无法启动：{exc}")
             return
 
-        targets = [WatchTarget(symbol, timeframe) for symbol, timeframe in self._targets]
         previous: dict[tuple[str, str], int] = {}
         skip_symbols: set[str] = set()
         logged_skip: set[str] = set()
@@ -337,6 +393,13 @@ class _WatchlistWorker(QThread):
                         "多品种监控：跳过已持仓/已挂单的品种 %s（这一轮不分析它们）",
                         sorted(skip_symbols) or "无",
                     )
+            # 动态选币：到点就用成交量突变重选标的（详见 orchestrator/screener.py）
+            if self._dynamic and (
+                _time.monotonic() - self._last_refresh >= self._dynamic_refresh_s
+            ):
+                self._refresh_targets(_new_source, skip_symbols)
+                self._last_refresh = _time.monotonic()
+            targets = [WatchTarget(symbol, timeframe) for symbol, timeframe in self._targets]
             self.status_update.emit(
                 f"多品种监控：正在检查 {len(targets)} 个品种"
                 f"（周期 {self._targets[0][1] if self._targets else ''}"
@@ -4588,14 +4651,44 @@ class MainWindow(QMainWindow):
             concurrency=int(getattr(general, "watch_concurrency", 1) or 1),
             skip_occupied=bool(getattr(general, "watch_skip_occupied", True)),
             make_trader=self._make_trader,
+            dynamic=bool(getattr(general, "watch_dynamic_enabled", False)),
+            dynamic_count=int(getattr(general, "watch_dynamic_count", 2) or 2),
+            dynamic_refresh_min=int(getattr(general, "watch_dynamic_refresh_min", 60) or 60),
+            dynamic_keep_static=bool(getattr(general, "watch_dynamic_keep_static", False)),
+            screen_cfg=self._screen_config(),
             make_orchestrator=self._build_orchestrator,
             parent=None,
         )
         worker.result_ready.connect(self._on_watchlist_result)
         worker.status_update.connect(self._on_status_update)
+        worker.targets_changed.connect(self._on_watchlist_targets_changed)
         self._watchlist_worker = worker
         worker.start()
         logger.info("多品种监控已启动：%s", [t.symbol for t in targets])
+
+    def _screen_config(self) -> Any:
+        """把 settings.general 里的选币门槛组装成 ScreenConfig。"""
+        from pa_agent.orchestrator.screener import ScreenConfig
+
+        general = getattr(getattr(self._ctx, "settings", None), "general", None)
+        return ScreenConfig.from_settings(general)
+
+    def _on_watchlist_targets_changed(self, targets: Any) -> None:
+        """动态选币换了标的（主线程）→ 刷新面板与状态栏。"""
+        panel = getattr(self, "_watchlist_panel", None)
+        if panel is None or not targets:
+            return
+        from pa_agent.orchestrator.watchlist import WatchTarget
+
+        rows = [WatchTarget(str(s), str(tf)) for s, tf in targets]
+        panel.set_targets(rows)
+        panel.set_status_text(
+            "动态选币已换榜：" + "、".join(str(s) for s, _ in targets)
+            + f"（每 {int(getattr(self._ctx.settings.general, 'watch_dynamic_refresh_min', 60))} 分钟重选）"
+        )
+        self._status_bar.showMessage(
+            "📈 动态选币换榜：" + "、".join(str(s) for s, _ in targets), 8000
+        )
 
     def _on_watchlist_result(self, result: Any) -> None:
         """某个品种一轮监控结束（主线程）。"""

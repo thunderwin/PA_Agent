@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -421,6 +422,12 @@ class OkxTradingDialog(QDialog):
     ) -> bool:
         """按当前交易所把凭据写进各自的文件（权限 600）。"""
         path = self._credentials_path()
+        # 覆盖前先备份一份：手滑、或者被自动化脚本写坏时还能捞回来（.bak 已 gitignore）
+        if path.exists():
+            try:
+                shutil.copy2(path, path.with_name(path.name + ".bak"))
+            except OSError as exc:
+                logger.warning("凭据备份失败（%s）：%s", path, exc)
         if self._venue() == "okx":
             payload = {
                 "api_key": cred.api_key,
