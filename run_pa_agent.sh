@@ -39,5 +39,14 @@ echo "  出口 IP          : ${OUT_IP:-获取失败（检查代理是否在运�
 echo "  代理             : ${HTTPS_PROXY:-未设置}"
 echo "─────────────────────────────────────────────"
 
+# 后台（无界面）运行：默认不弹窗口，只跑监控/分析/下单。
+# 需要看界面时用 PA_AGENT_HEADLESS=0 ./run_pa_agent.sh
+if [ "${PA_AGENT_HEADLESS:-1}" = "1" ]; then
+  export QT_QPA_PLATFORM=offscreen
+  echo "运行模式         : 后台无界面（要看界面就设 PA_AGENT_HEADLESS=0）"
+else
+  echo "运行模式         : 前台带界面"
+fi
+
 cd "$PROJECT_DIR"
 exec uv run python -m pa_agent.main
