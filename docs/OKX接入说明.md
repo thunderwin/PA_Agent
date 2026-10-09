@@ -100,7 +100,9 @@ OKX 每行 K 线是 `[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]`，程�
 
 ### 6.0 当前监控品种（2026-10-08 实测核实）
 
-`general.watch_symbols`（10 个，`general.watch_timeframe = 1h`）：
+`general.watch_symbols`（10 个，`general.watch_timeframe = 30m`）——
+**注意：这是 2026-10-08 定固定名单时的依据，现在实盘已改为「动态选币」**
+（见 [动态选币说明](动态选币说明.md)），且下单/行情都跑在币安上：
 
 | 品种 | 定位 | 对 BTC | 对现有组合平均相关 | 价差 | 24h 名义额 |
 |------|------|-------|-----------------|------|-----------|
@@ -168,8 +170,8 @@ OKX 每行 K 线是 `[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]`，程�
 | 项 | 值 |
 |----|----|
 | `trading.venue` | `okx`（`binance` = 换币安下单，见 [交易网关说明](交易网关说明.md)） |
-| `general.watch_dynamic_enabled` | `true`（按成交量突变换榜；`watch_dynamic_refresh_min = 120` 即 2 小时一次，见 [动态选币说明](动态选币说明.md)） |
-| `general.watch_timeframe` | `1h` |
+| `general.watch_dynamic_enabled` | `true`（按成交量突变换榜；`watch_dynamic_refresh_min = 60` 即 1 小时一次，见 [动态选币说明](动态选币说明.md)） |
+| `general.watch_timeframe` | `30m`（分析周期） |
 | `general.watch_concurrency` | `10`（并发分析线程数） |
 | `general.watch_skip_occupied` | `true`（已持仓/已挂单的品种跳过分析） |
 | `general.watch_interval_s` | `60`（探活间隔；只有新 K 线收盘才真正调模型） |
@@ -180,7 +182,7 @@ OKX 每行 K 线是 `[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]`，程�
 | `trading.max_open_positions` | `8` |
 | `trading.min_confidence` | `50` |
 | `trading.attach_take_profit` | `false`（止盈手动） |
-| `trading.pending_entry_expiry_bars` | `2`（= 2 根 1h = 2 小时） |
+| `trading.pending_entry_expiry_bars` | `4`（= 4 根 30m = 2 小时） |
 
 ### 6.2 以损定量（核心）
 
