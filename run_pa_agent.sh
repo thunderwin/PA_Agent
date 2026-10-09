@@ -19,14 +19,19 @@ else
   echo "提示：未找到 ~/.okx_env，OKX 下单所需的三个环境变量将为空。"
 fi
 
-# OKX 白名单绑的是代理出口 IP：双击启动时终端可能没有代理变量，这里补上本机默认代理。
-# （在终端里启动且已有代理变量时不会覆盖）
-if [ -z "$HTTPS_PROXY" ]; then
-  export HTTP_PROXY="http://127.0.0.1:10808"
-  export HTTPS_PROXY="http://127.0.0.1:10808"
-  export ALL_PROXY="socks5h://127.0.0.1:10808"
-  export NO_PROXY="localhost,127.0.0.1,::1"
-fi
+# ── 网络：把代理钉死 ─────────────────────────────────────────────────────────
+# 交易所的流量**固定走下面这个代理**，不依赖电脑当前的网络设置/系统代理：
+#   PA_PROXY_URL      通用代理地址（改这里就能换节点）
+#   PA_BINANCE_PROXY  币安专线（网关与行情数据源都读它）
+#   PA_OKX_PROXY      OKX 专线
+# 注意：这里固定的是"走哪个代理"，出口 IP 由代理客户端决定，本脚本控制不了。
+PA_PROXY_URL="${PA_PROXY_URL:-http://127.0.0.1:10808}"
+export PA_BINANCE_PROXY="${PA_BINANCE_PROXY:-$PA_PROXY_URL}"
+export PA_OKX_PROXY="${PA_OKX_PROXY:-$PA_PROXY_URL}"
+export HTTP_PROXY="$PA_PROXY_URL"
+export HTTPS_PROXY="$PA_PROXY_URL"
+export ALL_PROXY="$PA_PROXY_URL"
+export NO_PROXY="localhost,127.0.0.1,::1"
 
 echo "── OKX 交易凭据 ──────────────────────────────"
 [ -n "$OKX_API_KEY" ]     && echo "  OKX_API_KEY      : 已设置" || echo "  OKX_API_KEY      : 未设置"
@@ -34,9 +39,10 @@ echo "── OKX 交易凭据 ────────────────�
 [ -n "$OKX_PASSPHRASE" ]  && echo "  OKX_PASSPHRASE   : 已设置" || echo "  OKX_PASSPHRASE   : 未设置"
 
 echo "── 网络出口（OKX 看到的来源 IP）──────────────"
-OUT_IP="$(curl -s -m 8 https://api.ipify.org || true)"
-echo "  出口 IP          : ${OUT_IP:-获取失败（检查代理是否在运行）}"
-echo "  代理             : ${HTTPS_PROXY:-未设置}"
+OUT_IP="$(curl -s -m 8 --proxy "$PA_PROXY_URL" https://api.ipify.org || true)"
+echo "  固定代理         : $PA_PROXY_URL"
+echo "  出口 IP（经代理）: ${OUT_IP:-获取失败（检查代理是否在运行）}"
+echo "  说明             : 交易/行情一律走上面这个代理，不读电脑当前代理设置"
 echo "─────────────────────────────────────────────"
 
 # 后台（无界面）运行：默认不弹窗口，只跑监控/分析/下单。
