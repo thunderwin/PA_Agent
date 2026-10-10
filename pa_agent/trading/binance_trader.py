@@ -1046,10 +1046,25 @@ class BinanceTrader:
     # ── 止损核对 / 补挂 ───────────────────────────────────────────────────────
 
     def ensure_stops(self, inst_id: str | None = None) -> list[str]:
-        """核对"有持仓但没止损"的程序仓位，按意图记录补挂。"""
+        """核对**交易所上的真实持仓**，缺止损就补挂。
+
+        2026-10-10 修（实盘踩过）：原来只扫"意图文件里的品种"，一旦意图记录丢失、
+        或该品种从监控列表里轮换出去，就再也没人管它——US/ZK/BTC 三笔限价单成交后
+        就是这么裸奔的。现在改成**以交易所持仓为准**：
+
+        1. 有持仓、有意图记录 → 按 记录里的止损价 补挂；
+        2. 有持仓、**没有意图记录** → 按「每笔最多亏 ``max_loss_per_trade_usd``」
+           从持仓与开仓均价反推止损价，直接补挂（不再只报警）。
+        """
         notes: list[str] = []
         intents = _load_stop_intents()
-        symbols = [inst_id] if inst_id else list(intents.keys())
+        if inst_id:
+            symbols = [inst_id]
+        else:
+            try:
+                symbols = [str(p.get("instId") or "") for p in self.client.positions()]
+            except BinanceTradeError as exc:
+                return [f"读取持仓失败（无法核对止损）：{exc}"]
         for symbol in symbols:
             if not symbol:
                 continue
@@ -1074,9 +1089,28 @@ class BinanceTrader:
                 continue
             stop_px = _as_float((intents.get(symbol) or {}).get("stop_px"))
             if not stop_px:
-                notes.append(f"⚠️ {symbol} 有持仓但没有止损，也没有止损意图记录，请手动处理")
-                logger.warning("⚠️ %s 有持仓但无止损、也无意图记录，请手动补挂", symbol)
-                continue
+                stop_px = self._safety_stop_px(
+                    _as_float(rows[0].get("avgPx")) or 0.0, amount
+                )
+                if stop_px is None:
+                    notes.append(
+                        f"⚠️ {symbol} 有持仓但没有止损，也算不出安全距离"
+                        "（可能仓位过小），请手动处理"
+                    )
+                    logger.warning("⚠️ %s 有持仓但无止损且算不出安全距离，请手动补挂", symbol)
+                    continue
+                logger.warning(
+                    "⚠️ %s 有持仓但无止损意图记录，按「每笔最多亏 %.2f USDT」自动补挂 %.8g",
+                    symbol,
+                    float(getattr(self._settings, "max_loss_per_trade_usd", 0.0)),
+                    stop_px,
+                )
+                intents[symbol] = {
+                    "stop_px": stop_px, "size": abs(amount),
+                    "side": "buy" if amount > 0 else "sell", "filled": True,
+                    "ts": int(time.time() * 1000), "note": "程序兜底补挂",
+                }
+                _save_stop_intents(intents)
             side = "sell" if amount > 0 else "buy"
             try:
                 spec = self.spec_for(symbol)
@@ -1094,6 +1128,18 @@ class BinanceTrader:
                 notes.append(f"⚠️ {symbol} 补挂止损失败：{exc}")
                 logger.warning("补挂止损失败 %s：%s", symbol, exc)
         return notes
+
+    def _safety_stop_px(self, entry_px: float, amount: float) -> float | None:
+        """按「每笔最多亏 N USDT」从持仓反推一个保命止损价；算不出来返回 None。
+
+        币安 ``positionAmt`` 就是标的币数量，所以：亏损 = |数量| × 价格距离。
+        """
+        cap = float(getattr(self._settings, "max_loss_per_trade_usd", 0.0) or 0.0)
+        if cap <= 0 or entry_px <= 0 or abs(amount) <= 0:
+            return None
+        distance = cap / abs(amount)
+        stop = entry_px - distance if amount > 0 else entry_px + distance
+        return stop if stop > 0 else None
 
     def _has_stop_order(self, symbol: str) -> bool:
         """该品种是否已有止损单（查 Algo 条件单，也兼容普通挂单里的止损）。"""

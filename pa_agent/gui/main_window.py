@@ -4718,11 +4718,22 @@ class MainWindow(QMainWindow):
         self._ensure_stops(symbol)
 
     def _ensure_stops(self, symbol: str = "") -> None:
-        """核对/补挂止损（网关自己决定怎么做）。"""
+        """核对/补挂止损（网关自己决定怎么做）。
+
+        2026-10-10 修：以前是"每个品种结果回来就查它自己"，于是**轮换出去的品种
+        再也没人管**（US/ZK/BTC 就这么裸奔了）。现在按时间节流，每轮全量核对一次
+        **交易所上的所有持仓**（网关侧以持仓为准，不依赖监控列表）。
+        """
         trading = self._trading_settings()
         if trading is None or not getattr(trading, "enabled", False):
             return
         settings = self._ctx.settings
+        import time
+
+        now = time.time()
+        if now - float(getattr(self, "_last_stop_check", 0.0)) < 120.0:
+            return                                  # 最多 2 分钟一次，避免刷接口
+        self._last_stop_check = now
 
         import threading
 
@@ -4731,7 +4742,7 @@ class MainWindow(QMainWindow):
 
             try:
                 trader = create_trader(settings)
-                notes = trader.ensure_stops(symbol or None)
+                notes = trader.ensure_stops()       # 不传品种 = 核对全部持仓
                 for note in notes:
                     logger.warning("止损体检：%s", note)
                     self.trade_note.emit(f"止损体检：{note}")
