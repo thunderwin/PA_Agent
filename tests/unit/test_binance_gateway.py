@@ -472,6 +472,7 @@ def _trader(monkeypatch, tmp_path, client: _FakeClient, **over) -> BinanceTrader
         enabled=True, simulated=True, trigger_mode="manual", venue="binance",
         max_loss_per_trade_usd=2.0, max_notional_usd=2000.0, leverage=10,
         min_confidence=50, max_open_positions=8,
+        risk_reward_ratio=0.0, attach_take_profit=False,
     )
     base.update(over)
     trading = TradingSettings(**base)

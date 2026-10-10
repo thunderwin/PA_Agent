@@ -946,6 +946,7 @@ class BinanceTrader:
             leverage=int(getattr(s, "leverage", 3)),
             price=price,
             max_notional_usd=float(getattr(s, "max_notional_usd", 0.0) or 0.0),
+            risk_reward_ratio=float(getattr(s, "risk_reward_ratio", 0.0) or 0.0),
         )
         floor = self.min_notional(symbol)
         if floor and plan.notional_usd < floor:
@@ -1157,6 +1158,7 @@ class BinanceTrader:
             "stop_px": plan.stop_px,
             "size": plan.size,
             "side": plan.side,
+            "take_profit_px": plan.take_profit_px,
             "filled": bool(filled),
             "ts": int(time.time() * 1000),
         }

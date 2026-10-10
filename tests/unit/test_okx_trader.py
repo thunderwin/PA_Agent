@@ -545,7 +545,8 @@ class _FakeClient:
 
 
 def _trader(**settings_over) -> tuple[OkxTrader, _FakeClient, _FakeMarket]:
-    over = {"enabled": True, "simulated": True, "trigger_mode": "manual", **settings_over}
+    over = {"enabled": True, "simulated": True, "trigger_mode": "manual",
+            "risk_reward_ratio": 0.0, "attach_take_profit": False, **settings_over}
     trading = TradingSettings(**over)
     client = _FakeClient()
     market = _FakeMarket()
@@ -875,3 +876,22 @@ def test_live_execution_requires_acknowledgement(tmp_path):
     trading.live_ack = True
     ok = trader.execute(_decision(), symbol="BTC-USDT-SWAP", dry_run=False, manual_confirm=True)
     assert ok.sent is True
+
+
+def test_plan_order_uses_fixed_risk_reward_ratio():
+    """固定盈亏比 2.5：止盈 = 入场 + 2.5 × 止损距离（覆盖 AI 的目标价）。"""
+    plan = plan_order(
+        _decision(entry_price=85000.0, stop_loss_price=84900.0, take_profit_price=85200.0),
+        BTC_SWAP, equity_usd=10_000.0, max_loss_usd=10.0, leverage=10,
+        risk_reward_ratio=2.5,
+    )
+    assert plan.take_profit_px == pytest.approx(85250.0)     # 不是 AI 的 85200
+    assert plan.stop_px == pytest.approx(84900.0)            # 止损距离不受影响
+
+
+def test_plan_order_without_ratio_keeps_ai_take_profit():
+    plan = plan_order(
+        _decision(entry_price=85000.0, stop_loss_price=84900.0, take_profit_price=85300.0),
+        BTC_SWAP, equity_usd=10_000.0, max_loss_usd=10.0, leverage=10,
+    )
+    assert plan.take_profit_px == pytest.approx(85300.0)

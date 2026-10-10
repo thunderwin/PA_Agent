@@ -578,11 +578,14 @@ def plan_order(
     leverage: int = 3,
     price: float | None = None,
     max_notional_usd: float = 0.0,
+    risk_reward_ratio: float = 0.0,
 ) -> OrderPlan:
     """把阶段二决策翻译成具体订单，并保证止损亏损 ≤ ``max_loss_usd``。
 
     ``price`` 用于市价单（用最新价估算风险）；缺省时用决策里的 entry_price。
     ``max_notional_usd`` > 0 时再按名义额上限缩量（实际风险只会更小）。
+    ``risk_reward_ratio`` > 0 时**忽略 AI 给的止盈价**，按固定盈亏比重算止盈
+    （原引擎的止盈实际只到 RR≈1.0，盈亏比偏低）。
     """
     if not isinstance(decision, dict):
         raise TradeRejected("决策内容为空，无法下单")
@@ -629,6 +632,17 @@ def plan_order(
         if risk_per_unit <= 0:
             raise TradeRejected("现价与止损价重合，无法评估风险")
         notes.append(f"按现价 {_fmt_num(price)} 估算")
+
+    if risk_reward_ratio and risk_reward_ratio > 0:
+        # 固定盈亏比：止盈 = 入场 ± 盈亏比 × 止损距离（覆盖 AI 的目标价）
+        tp = (
+            entry + risk_reward_ratio * risk_per_unit
+            if long
+            else entry - risk_reward_ratio * risk_per_unit
+        )
+        if tp <= 0:
+            raise TradeRejected("按盈亏比算出的止盈价非正，拒绝下单")
+        notes.append(f"止盈按 1:{risk_reward_ratio:g} 盈亏比设置（覆盖 AI 目标价）")
 
     if spec.derivative:
         if spec.ct_val <= 0:
@@ -977,6 +991,7 @@ class OkxTrader:
             leverage=int(getattr(s, "leverage", 3)),
             price=price,
             max_notional_usd=float(getattr(s, "max_notional_usd", 0.0) or 0.0),
+            risk_reward_ratio=float(getattr(s, "risk_reward_ratio", 0.0) or 0.0),
         )
         if dry_run:
             return ExecutionResult(

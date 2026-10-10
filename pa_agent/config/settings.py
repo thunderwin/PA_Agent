@@ -194,9 +194,11 @@ class TradingSettings(BaseModel):
     max_loss_per_trade_usd: float = Field(default=10.0, gt=0, le=10_000)
     #: 单笔名义额上限（USDT）；0 = 不限制。触顶时自动缩量——实际风险只会更小，不会更大。
     max_notional_usd: float = Field(default=0.0, ge=0.0, le=1_000_000)
-    #: 是否把 AI 算出的止盈一并挂到交易所。
+    #: 固定盈亏比（0 = 用 AI 的止盈价）。>0 时按 入场 ± 比值×止损距离 重算止盈。
+    risk_reward_ratio: float = Field(default=2.5, ge=0.0, le=100.0)
+    #: 是否把止盈一并挂到交易所。
     #: False（默认）= 只挂止损，止盈由人工了结；True = 恢复"止损+止盈一起托管"。
-    attach_take_profit: bool = False
+    attach_take_profit: bool = True
     #: 入场挂单的有效期（K 线根数）：超过这么多根仍未成交就自动撤单，0 = 不撤。
     #: 只撤程序自己下的单（带 tag=PAAGENT），绝不碰手动挂单。
     pending_entry_expiry_bars: int = Field(default=8, ge=0, le=200)
