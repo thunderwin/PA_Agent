@@ -57,15 +57,19 @@ class ScreenConfig:
 
     window_hours: int = 6
     bars: int = 300
-    #: 24h 成交额下限（2026-10-09 从 200 万上调到 2000 万：薄币点差大、滑点大）
-    min_volume_usd: float = 20_000_000.0
+    #: 24h 成交额下限。2026-10-10 从 2000 万降到 800 万：2000 万会让"基线 700~1400 万"
+    #: 的品种必须放量满一整天才能把滚动 24h 推过门槛（ZK 实测晚了 24 小时）。
+    #: 流动性把关交给更准更快的盘口深度（min_depth_usd）。
+    min_volume_usd: float = 8_000_000.0
     max_volume_usd: float = 400_000_000.0
     min_burst: float = 6.0
     min_ratio: float = 3.0
     day_ratio: float = 2.5
     quiet_max: float = 2.0
     min_window_usd: float = 1_000_000.0
-    min_persist: int = 3
+    min_persist: int = 2
+    #: 快速通道：最近 2 根**都** ≥ 这个倍数 × 基线 p90（约 1~2 小时就能触发）
+    fast_lane_multiple: float = 3.0
     max_spread_bp: float = 15.0
     #: 盘口"中位价 ±0.5% 内较小一侧"累计名义额的下限（USDT）
     #: 2 万 ≈ 实际下单量（约 130 USDT）只吃到可见深度的 0.7%，留足余量
@@ -83,8 +87,8 @@ class ScreenConfig:
             return cls()
         return cls(
             min_volume_usd=float(
-                getattr(general, "watch_dynamic_min_volume_usd", 20_000_000.0)
-                or 20_000_000.0
+                getattr(general, "watch_dynamic_min_volume_usd", 8_000_000.0)
+                or 8_000_000.0
             ),
             max_volume_usd=float(
                 getattr(general, "watch_dynamic_max_volume_usd", 400_000_000.0)
@@ -125,6 +129,8 @@ class Candidate:
     persist: int
     spread_bp: float
     price: float
+    #: 是否是"快速通道"入选（最近两根就爆量，不等 6h/日线口径）
+    fast_lane: bool = False
     #: 盘口前 5 档较小一侧的累计名义额（只有入选候选才去验，未验时 0）
     depth_usd: float = 0.0
     score: float = 0.0
@@ -216,8 +222,20 @@ def evaluate_bars(
     p90 = _percentile(baseline_hourly, 0.9)
     persist = sum(1 for v in now_bars if v > p90)
 
+    # 快速通道：最近两根都 ≥ fast_lane_multiple × p90 → 不等 6 小时窗口/日线口径
+    tail = now_bars[-2:] if len(now_bars) >= 2 else now_bars
+    fast_lane = bool(tail) and min(tail) >= cfg.fast_lane_multiple * max(p90, 1.0)
+
     price = prices[-1] if prices else 0.0
-    score = burst + 3.0 * math.log10(max(ratio, 1.0)) + 2.0 * math.log10(max(d0 / 1e6, 1.0))
+    # "今天/昨天"从**硬门槛**降级为加分项：它天生要求放量满一天，是延迟的主因
+    day_ratio_value = d0 / max(d1, d2, 1.0)
+    score = (
+        burst
+        + 3.0 * math.log10(max(ratio, 1.0))
+        + 2.0 * math.log10(max(d0 / 1e6, 1.0))
+        + (2.0 if fast_lane else 0.0)
+        + 1.5 * min(day_ratio_value, 5.0)
+    )
 
     reasons: list[str] = []
     if not (cfg.min_volume_usd <= d0 <= cfg.max_volume_usd):
@@ -225,18 +243,17 @@ def evaluate_bars(
             f"24h 成交额 {d0/1e6:.1f}M 不在 {cfg.min_volume_usd/1e6:.0f}M~"
             f"{cfg.max_volume_usd/1e6:.0f}M 区间"
         )
-    if burst < cfg.min_burst:
-        reasons.append(f"突变强度 {burst:.1f} < {cfg.min_burst}")
-    if ratio < cfg.min_ratio:
-        reasons.append(f"放大 {ratio:.1f}x < {cfg.min_ratio}x")
-    if d0 < cfg.day_ratio * max(d1, d2):
-        reasons.append(f"今天/昨天只有 {d0/max(d1,1):.1f}x")
+    if not fast_lane:                        # 快速通道已自带"两根持续放量"的证据
+        if burst < cfg.min_burst:
+            reasons.append(f"突变强度 {burst:.1f} < {cfg.min_burst}")
+        if ratio < cfg.min_ratio:
+            reasons.append(f"放大 {ratio:.1f}x < {cfg.min_ratio}x")
+        if persist < cfg.min_persist:
+            reasons.append(f"最近 {window} 根只 {persist} 根放量 < {cfg.min_persist}")
     if max(d1, d2) > cfg.quiet_max * med_daily:
         reasons.append("之前就已在放量")
     if current < cfg.min_window_usd:
         reasons.append(f"最近 {window}h 只有 {current/1e4:.0f} 万 USDT")
-    if persist < cfg.min_persist:
-        reasons.append(f"最近 {window} 根只 {persist} 根放量 < {cfg.min_persist}")
     if spread_bp > 0 and cfg.max_spread_bp > 0 and spread_bp > cfg.max_spread_bp:
         reasons.append(f"点差 {spread_bp:.1f}bp > {cfg.max_spread_bp}bp")
 
@@ -252,6 +269,7 @@ def evaluate_bars(
         persist=persist,
         spread_bp=spread_bp,
         price=price,
+        fast_lane=fast_lane,
         score=score,
         reasons=tuple(reasons),
         returns=_log_returns(prices[-73:]),

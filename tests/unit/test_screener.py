@@ -282,6 +282,37 @@ def test_config_from_settings_defaults():
     assert cfg == ScreenConfig()
 
 
+# ── 快速通道（2026-10-10 新增）────────────────────────────────────────────────
+
+
+def test_fast_lane_fires_within_two_bars():
+    """最近两根都爆量 → 不等 6 小时窗口/日线口径就入选（ZK 实测晚了 24 小时）。"""
+    volumes = [_LIQ_BASE] * (BAR_HOURS - 7) + [_LIQ_BASE] * 5 + [
+        _LIQ_BASE * 6, _LIQ_BASE * 6
+    ]
+    cand = evaluate_bars(_bars(volumes), "FAST-USDT-SWAP", CFG)
+    assert cand is not None and cand.fast_lane is True
+    assert cand.ok, cand.reasons
+
+
+def test_day_ratio_is_no_longer_a_hard_gate():
+    """今天/昨天不到 2.5 倍也能入选（它已降级为加分项）。"""
+    volumes = [_LIQ_BASE] * (BAR_HOURS - 6) + [_LIQ_BASE * 4] * 6
+    cand = evaluate_bars(_bars(volumes), "SLOW-USDT-SWAP", CFG)
+    assert cand is not None
+    assert cand.day_ratio < CFG.day_ratio          # 确实没过旧门槛
+    assert cand.ok, cand.reasons                   # 但不再因此被拒
+    assert not any("今天/昨天" in r for r in cand.reasons)
+
+
+def test_single_spike_still_rejected():
+    """快速通道要求"连续两根"，单根尖峰照样不算。"""
+    volumes = [_LIQ_BASE] * (BAR_HOURS - 2) + [_LIQ_BASE, _LIQ_BASE * 20]
+    cand = evaluate_bars(_bars(volumes), "SPIKE2-USDT-SWAP", CFG)
+    assert cand is not None and cand.fast_lane is False
+    assert not cand.ok
+
+
 def test_dynamic_defaults_are_off():
     """默认不开启动态选币：升级后行为不能变。"""
     from pa_agent.config.settings import GeneralSettings

@@ -116,11 +116,11 @@ class GeneralSettings(BaseModel):
     #: 每轮选几个（用户要的是 2 个）
     watch_dynamic_count: int = Field(default=2, ge=1, le=20)
     #: 多久重选一次（分钟）
-    watch_dynamic_refresh_min: int = Field(default=120, ge=5, le=1440)
+    watch_dynamic_refresh_min: int = Field(default=30, ge=5, le=1440)
     #: True = 保留静态列表并**追加**选出来的（默认 False = 整个换掉）
     watch_dynamic_keep_static: bool = False
     #: 选币门槛：24h 成交额区间（USDT）
-    watch_dynamic_min_volume_usd: float = Field(default=20_000_000.0, gt=0)
+    watch_dynamic_min_volume_usd: float = Field(default=8_000_000.0, gt=0)
     watch_dynamic_max_volume_usd: float = Field(default=400_000_000.0, gt=0)
     #: 选币门槛：最近 6 小时成交额下限（USDT）
     watch_dynamic_min_window_usd: float = Field(default=1_000_000.0, gt=0)
