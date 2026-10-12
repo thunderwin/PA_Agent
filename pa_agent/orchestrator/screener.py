@@ -78,6 +78,12 @@ class ScreenConfig:
     max_depth_probe: int = 8
     max_gap_ratio: float = 0.10
     max_correlation: float = 0.6
+    #: 波动闸门：1h ATR% 超过它就算"波动过大"（0 = 不开闸门）
+    #: 2026-10-12 加：30m ATR 5%+ 的小币，任何小于 2×ATR 的止损都是噪音止损
+    #: （RSR 那笔：入场后一根 15m 就砸了 11%，把止损扫掉，2 小时后价格又涨回来）
+    max_atr_pct: float = 0.0
+    #: 闸门模式：``record`` = 只记录不拦（默认，先攒样本）；``skip`` = 直接排除
+    atr_gate_mode: str = "record"
     exclude: tuple[str, ...] = ()
 
     @classmethod
@@ -106,6 +112,10 @@ class ScreenConfig:
                 getattr(general, "watch_dynamic_min_depth_usd", 20_000.0)
                 or 20_000.0
             ),
+            max_atr_pct=float(getattr(general, "watch_dynamic_max_atr_pct", 0.0) or 0.0),
+            atr_gate_mode=str(
+                getattr(general, "watch_dynamic_atr_gate_mode", "record") or "record"
+            ).strip().lower(),
             exclude=tuple(
                 str(s).strip().upper()
                 for s in (getattr(general, "watch_dynamic_exclude", []) or [])
@@ -131,6 +141,8 @@ class Candidate:
     price: float
     #: 是否是"快速通道"入选（最近两根就爆量，不等 6h/日线口径）
     fast_lane: bool = False
+    #: ATR14 / 最新收盘 × 100（用选币自己的 1h K 线算）。0 = 数据不足，未算出
+    atr_pct: float = 0.0
     #: 盘口前 5 档较小一侧的累计名义额（只有入选候选才去验，未验时 0）
     depth_usd: float = 0.0
     score: float = 0.0
@@ -170,6 +182,38 @@ def _log_returns(prices: list[float]) -> tuple[float, ...]:
     for prev, cur in zip(prices, prices[1:], strict=False):
         out.append(math.log(cur / prev) if prev > 0 and cur > 0 else 0.0)
     return tuple(out)
+
+
+def atr_pct_of(bars: list[Any], period: int = 14) -> float:
+    """ATR``period`` ÷ 最新收盘 × 100（%）。数据不足或没有 high/low 时返回 0.0。
+
+    ``bars`` 需 newest-first。0.0 表示"算不出来"，调用方**不要**当成"波动很小"。
+    """
+    closed = [b for b in bars if getattr(b, "closed", True)]
+    if len(closed) < period + 1:
+        return 0.0
+    trs: list[float] = []
+    prev_close: float | None = None
+    for bar in reversed(closed):                       # 旧 → 新
+        high = getattr(bar, "high", None)
+        low = getattr(bar, "low", None)
+        close = getattr(bar, "close", None)
+        try:
+            h, l = float(high), float(low)
+            c = float(close)
+        except (TypeError, ValueError):
+            prev_close = None
+            continue
+        if prev_close is not None and c > 0:
+            trs.append(max(h - l, abs(h - prev_close), abs(l - prev_close)))
+        prev_close = c
+    if len(trs) < period:
+        return 0.0
+    atr = sum(trs[-period:]) / period
+    last_close = float(getattr(closed[0], "close", 0.0) or 0.0)
+    if last_close <= 0:
+        return 0.0
+    return atr / last_close * 100.0
 
 
 def evaluate_bars(
@@ -257,6 +301,17 @@ def evaluate_bars(
     if spread_bp > 0 and cfg.max_spread_bp > 0 and spread_bp > cfg.max_spread_bp:
         reasons.append(f"点差 {spread_bp:.1f}bp > {cfg.max_spread_bp}bp")
 
+    atr_pct = atr_pct_of(bars)
+    # 波动闸门（2026-10-12 加）：1h ATR% 太高的币，止损必然落在噪音里
+    # （RSR：30m ATR 5.5%，入场后一根 15m 砸 11%，把 1.3×ATR 的止损扫掉，
+    # 两小时后价格又涨回入场价之上）。record = 只记录不拦，skip = 直接排除。
+    if (
+        cfg.max_atr_pct > 0
+        and atr_pct > cfg.max_atr_pct
+        and cfg.atr_gate_mode == "skip"
+    ):
+        reasons.append(f"波动过大（1h ATR {atr_pct:.1f}% > {cfg.max_atr_pct:.1f}%）")
+
     return Candidate(
         symbol=symbol,
         burst=burst,
@@ -270,6 +325,7 @@ def evaluate_bars(
         spread_bp=spread_bp,
         price=price,
         fast_lane=fast_lane,
+        atr_pct=atr_pct,
         score=score,
         reasons=tuple(reasons),
         returns=_log_returns(prices[-73:]),
@@ -465,6 +521,18 @@ def pick_symbols(
                     )
                     continue
         picked.append(cand)
+        # 波动闸门（记录模式）：照常分析/下单，但把"这个币波动有多大"记进日志，
+        # 攒几天样本再决定要不要改成 skip（见 docs/动态选币说明.md）。
+        if (
+            cfg.max_atr_pct > 0
+            and cand.atr_pct > cfg.max_atr_pct
+            and cfg.atr_gate_mode != "skip"
+        ):
+            logger.warning(
+                "⚠️ 波动闸门（记录模式）：%s 1h ATR %.1f%% > 门槛 %.1f%%"
+                "——止损容易被噪音扫掉，先记着，暂不拦单",
+                cand.symbol, cand.atr_pct, cfg.max_atr_pct,
+            )
         if len(picked) >= max(int(count), 1):
             break
     return picked
@@ -504,7 +572,7 @@ def _cli() -> int:  # pragma: no cover - 手动跑用
     for c in chosen:
         print(f"    {c.symbol}: 24h {c.volume_24h_usd/1e6:.1f}M · 6h {c.volume_window_usd/1e4:.0f}万 · "
               f"点差 {c.spread_bp:.1f}bp · 前5档 {c.depth_usd/1e4:.1f}万 USDT · "
-              f"突变 {c.burst:.1f} · 放大 {c.ratio:.1f}x")
+              f"突变 {c.burst:.1f} · 放大 {c.ratio:.1f}x · 1h ATR {c.atr_pct:.1f}%")
     return 0
 
 

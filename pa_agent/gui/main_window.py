@@ -355,7 +355,12 @@ class _WatchlistWorker(QThread):
         logger.warning(
             "动态选币换榜：%s%s",
             symbols,
-            "（" + "；".join(f"{c.symbol} 突变{c.burst:.0f} 放大{c.ratio:.1f}x" for c in picked) + "）"
+            "（"
+            + "；".join(
+                f"{c.symbol} 突变{c.burst:.0f} 放大{c.ratio:.1f}x 波动{c.atr_pct:.1f}%"
+                for c in picked
+            )
+            + "）"
             if picked
             else "",
         )

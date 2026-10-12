@@ -130,6 +130,10 @@ class GeneralSettings(BaseModel):
     watch_dynamic_min_depth_usd: float = Field(default=20_000.0, gt=0)
     #: 选币门槛：突变强度（稳健 z 分数）
     watch_dynamic_min_burst: float = Field(default=6.0, gt=0)
+    #: 选币波动闸门：1h ATR% 超过它就算"波动过大"（0 = 不开闸门，2026-10-12 加）
+    watch_dynamic_max_atr_pct: float = Field(default=0.0, ge=0)
+    #: 闸门模式：``record`` = 只记录不拦（先攒样本）；``skip`` = 直接从候选里排除
+    watch_dynamic_atr_gate_mode: str = "record"
     #: 选币时额外排除的品种（规范写法）
     watch_dynamic_exclude: list[str] = Field(default_factory=list)
     #: 监控到可下单方案时播放提示音并提示

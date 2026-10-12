@@ -321,3 +321,104 @@ def test_dynamic_defaults_are_off():
     assert general.watch_dynamic_enabled is False
     assert general.watch_dynamic_count == 2
     assert general.watch_dynamic_keep_static is False
+
+
+# ── 波动闸门（1h ATR%）：2026-10-12 加 ────────────────────────────────────────
+
+
+def _bars_with_range(volumes: list[float], *, high: float, low: float, price: float):
+    """带 high/low 的 K 线（波动闸门要用它们算 ATR）。"""
+    values = list(volumes)
+    bars = [
+        SimpleNamespace(amount=v, close=price, high=high, low=low, closed=True)
+        for v in values
+    ]
+    bars.reverse()
+    return bars
+
+
+def test_atr_pct_of_computes_true_range():
+    """高 105 / 低 95 / 收 100 → ATR=10 → ATR% = 10%。"""
+    from pa_agent.orchestrator.screener import atr_pct_of
+
+    bars = _bars_with_range([1.0] * 30, high=105.0, low=95.0, price=100.0)
+    assert atr_pct_of(bars) == pytest.approx(10.0, rel=1e-6)
+
+
+def test_atr_pct_of_is_zero_without_high_low():
+    """没有 high/low（老测试用的假 K 线）→ 返回 0，表示"算不出来"。"""
+    from pa_agent.orchestrator.screener import atr_pct_of
+
+    assert atr_pct_of(_bars(_series(_LIQ_BASE, _LIQ_BURST))) == 0.0
+
+
+def test_atr_gate_records_but_does_not_block_by_default():
+    """record 模式：高波动币照常入选，只是把 ATR% 记下来。"""
+    cfg = ScreenConfig(max_atr_pct=4.0)          # 默认 mode=record
+    volumes = _series(_LIQ_BASE, _LIQ_BURST)
+    cand = evaluate_bars(
+        _bars_with_range(volumes, high=105.0, low=95.0, price=100.0),
+        "WILD-USDT-SWAP", cfg,
+    )
+    assert cand is not None
+    assert cand.atr_pct == pytest.approx(10.0, rel=1e-6)
+    assert cand.ok, cand.reasons                 # 记录模式不拦
+    assert not any("波动过大" in r for r in cand.reasons)
+
+
+def test_atr_gate_skip_mode_rejects_high_volatility(tmp_path):
+    """skip 模式：ATR% 超门槛的币被排除，低波动的照常通过。"""
+    cfg = ScreenConfig(max_atr_pct=4.0, atr_gate_mode="skip")
+    volumes = _series(_LIQ_BASE, _LIQ_BURST)
+    wild = evaluate_bars(
+        _bars_with_range(volumes, high=105.0, low=95.0, price=100.0),
+        "WILD-USDT-SWAP", cfg,
+    )
+    calm = evaluate_bars(
+        _bars_with_range(volumes, high=100.5, low=99.5, price=100.0),
+        "CALM-USDT-SWAP", cfg,
+    )
+    assert wild is not None and not wild.ok
+    assert any("波动过大" in r for r in wild.reasons)
+    assert calm is not None and calm.ok, calm.reasons
+    assert calm.atr_pct == pytest.approx(1.0, rel=1e-6)
+
+
+def test_atr_gate_disabled_when_zero():
+    """门槛 0 = 不开闸门（老配置的行为完全不变）。"""
+    cfg = ScreenConfig(max_atr_pct=0.0, atr_gate_mode="skip")
+    cand = evaluate_bars(
+        _bars_with_range(_series(_LIQ_BASE, _LIQ_BURST), high=105.0, low=95.0, price=100.0),
+        "WILD-USDT-SWAP", cfg,
+    )
+    assert cand is not None and cand.ok, cand.reasons
+
+
+def test_config_from_settings_reads_atr_gate_fields():
+    general = SimpleNamespace(
+        watch_dynamic_max_atr_pct=4.0, watch_dynamic_atr_gate_mode="SKIP"
+    )
+    cfg = ScreenConfig.from_settings(general)
+    assert cfg.max_atr_pct == pytest.approx(4.0)
+    assert cfg.atr_gate_mode == "skip"           # 大小写不敏感
+
+
+def test_pick_symbols_logs_volatility_warning_in_record_mode(caplog):
+    """record 模式：入选但波动超门槛的币照常被选，同时记一条日志。"""
+    import logging
+
+    cfg = ScreenConfig(max_atr_pct=4.0)          # mode=record
+    wild = _cand("WILD-USDT-SWAP", 100.0, ())
+    wild.atr_pct = 7.5
+    calm = _cand("CALM-USDT-SWAP", 50.0, (0.5, -0.5))
+    calm.atr_pct = 3.0
+
+    with caplog.at_level(logging.WARNING, logger="pa_agent.orchestrator.screener"):
+        picked = pick_symbols(
+            _FakeSource({}), cfg, count=2, candidates=[wild, calm]
+        )
+
+    assert [c.symbol for c in picked] == ["WILD-USDT-SWAP", "CALM-USDT-SWAP"]
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "波动闸门" in logged and "WILD-USDT-SWAP" in logged, logged
+    assert "CALM-USDT-SWAP" not in logged
