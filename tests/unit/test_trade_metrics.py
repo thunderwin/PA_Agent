@@ -1,14 +1,20 @@
 """Unit tests for trade_metrics helpers."""
 from __future__ import annotations
 
+import pytest
+
 from pa_agent.util.trade_metrics import (
+    NARROW_STOP_ATR_MULTIPLE,
     adjust_decision_stop_for_tp1_rr_cap,
+    atr_from_frame,
     compute_risk_reward,
+    decision_stop_atr_multiple,
     format_estimated_win_rate,
     format_estimated_win_rate_reasoning,
     is_long_direction,
     max_risk_reward_ratio,
     min_risk_reward_ratio,
+    stop_atr_multiple,
     widen_stop_for_tp1_rr_cap,
 )
 
@@ -76,3 +82,49 @@ def test_format_estimated_win_rate_from_model_field():
     }
     assert format_estimated_win_rate(decision) == "47%"
     assert "47" in format_estimated_win_rate_reasoning(decision)
+
+
+# ── 止损宽度 = N×ATR（2026-10-12 加）─────────────────────────────────────────
+
+
+def test_stop_atr_multiple_is_dimensionless():
+    """同样 1.5×ATR：低价币和高价币应该算出同一个倍数。"""
+    # RSR 实盘：入场 0.00233 / 止损 0.002164 / 30m ATR 0.000131 → 约 1.27×
+    assert stop_atr_multiple(0.00233, 0.002164, 0.000131) == pytest.approx(1.267, rel=0.01)
+    # BTC 假想：入场 85000 / 止损 84000 / ATR 1000 → 1.0×
+    assert stop_atr_multiple(85000, 84000, 1000) == pytest.approx(1.0)
+
+
+def test_stop_atr_multiple_handles_bad_input():
+    assert stop_atr_multiple(None, 1, 1) is None
+    assert stop_atr_multiple(100, None, 1) is None
+    assert stop_atr_multiple(100, 90, 0) is None          # ATR 0 → 算不出
+    assert stop_atr_multiple(100, 100, 5) is None         # 入场=止损 → 算不出
+
+
+def test_atr_from_frame_reads_latest_atr():
+    from types import SimpleNamespace
+
+    frame = SimpleNamespace(indicators=SimpleNamespace(atr14=(12.0, 11.0, 10.0)))
+    assert atr_from_frame(frame) == pytest.approx(12.0)
+    assert atr_from_frame(SimpleNamespace(indicators=None)) is None
+    assert atr_from_frame(SimpleNamespace(indicators=SimpleNamespace(atr14=()))) is None
+    assert atr_from_frame(SimpleNamespace(indicators=SimpleNamespace(atr14=(0.0,)))) is None
+
+
+def test_decision_stop_atr_multiple_only_for_executable_plans():
+    from types import SimpleNamespace
+
+    frame = SimpleNamespace(indicators=SimpleNamespace(atr14=(0.000131,)))
+    order = {
+        "order_type": "限价单",
+        "entry_price": 0.00233,
+        "stop_loss_price": 0.002164,
+    }
+    assert decision_stop_atr_multiple(order, frame) == pytest.approx(1.267, rel=0.01)
+    assert decision_stop_atr_multiple({**order, "order_type": "不下单"}, frame) is None
+    assert decision_stop_atr_multiple("not a dict", frame) is None
+
+
+def test_narrow_stop_reference_line_is_documented_value():
+    assert NARROW_STOP_ATR_MULTIPLE == pytest.approx(1.5)

@@ -3,6 +3,11 @@ from __future__ import annotations
 
 from typing import Any
 
+#: "偏窄止损"的参考线（只需 ATR 倍数）：低于它的止损大概率落在该币的正常噪音里。
+#: 2026-10-12 起只用于日志提示，**尚未**用来拦单 —— 当天 7 笔成交里两笔赢家
+#: （GRASS 0.36×、RVN 0.79×）反而比输家（1.05~1.5×）更窄，样本不足以定门槛。
+NARROW_STOP_ATR_MULTIPLE: float = 1.5
+
 
 def is_long_direction(direction: object) -> bool | None:
     """Return True for long, False for short, None if unknown."""
@@ -466,3 +471,55 @@ def validate_order_trade_metrics(
     errors.extend(validate_take_profit_2_geometry(decision))
 
     return errors
+
+
+def atr_from_frame(kline_frame: Any) -> float | None:
+    """取 K 线帧里最新的 ATR14；取不到（没算指标 / 值为空）时返回 None。"""
+    indicators = getattr(kline_frame, "indicators", None)
+    atr = getattr(indicators, "atr14", None)
+    if not atr:
+        return None
+    try:
+        value = float(atr[0])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return value if value > 0 else None
+
+
+def stop_atr_multiple(entry: object, stop_loss: object, atr: object) -> float | None:
+    """止损距离 ÷ ATR —— 用**这个币自己的波动**衡量止损够不够宽。
+
+    为什么不用"止损距离 ÷ 价格"（固定百分比）：每种币的正常波动本来就不一样，
+    BTC 的 2% 和 RSR 的 2% 完全不是一回事（2026-10-12 用户指出）。
+    ATR 倍数是无量纲的：1.5×ATR 对任何币都表示"离正常噪音 1.5 倍远"。
+
+    返回 None 表示算不出（缺值 / ATR ≤ 0 / 止损与入场相同）。
+    """
+    try:
+        e = float(entry)
+        sl = float(stop_loss)
+        a = float(atr)
+    except (TypeError, ValueError):
+        return None
+    if a <= 0 or e <= 0:
+        return None
+    distance = abs(e - sl)
+    if distance <= 0:
+        return None
+    return distance / a
+
+
+def decision_stop_atr_multiple(
+    decision: Any, kline_frame: Any
+) -> float | None:
+    """从决策 + K 线帧算"止损距离 = N×ATR"；算不出返回 None。"""
+    if not isinstance(decision, dict):
+        return None
+    if decision.get("order_type") not in ("限价单", "突破单", "市价单"):
+        return None
+    atr = atr_from_frame(kline_frame)
+    if atr is None:
+        return None
+    return stop_atr_multiple(
+        decision.get("entry_price"), decision.get("stop_loss_price"), atr
+    )

@@ -1271,3 +1271,32 @@ def test_coerce_breakout_without_basis_to_limit() -> None:
     assert _coerce_breakout_without_basis(out) is True
     assert out["decision"]["order_type"] == "限价单"
     assert out["decision"]["entry_rule"] is None
+
+
+def test_normalize_stage2_logs_stop_width_in_atr(caplog) -> None:
+    """每个可执行计划都记一条「止损距离 = N×ATR」（2026-10-12 加，只记录不拦单）。"""
+    import logging
+    from types import SimpleNamespace
+
+    payload = {
+        "decision": {
+            "order_type": "限价单",
+            "order_direction": "做多",
+            "entry_price": 0.00233,
+            "stop_loss_price": 0.002164,
+            "take_profit_price": 0.002496,
+        }
+    }
+    # 30m ATR14 = 0.000131 → 止损宽度 (0.00233-0.002164)/0.000131 ≈ 1.27×
+    frame = SimpleNamespace(
+        symbol="RSR-USDT-SWAP",
+        timeframe="30m",
+        indicators=SimpleNamespace(atr14=(0.000131, 0.00012)),
+    )
+    with caplog.at_level(logging.WARNING, logger="pa_agent.ai.stage2_normalizer"):
+        normalize_stage2(payload, kline_frame=frame)
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "计划止损宽度" in logged, logged
+    assert "RSR-USDT-SWAP" in logged and "1.27" in logged, logged
+    assert "偏窄" in logged, logged          # 1.27× < 1.5× 参考线

@@ -1578,10 +1578,30 @@ def normalize_stage2(
             decision.get("entry_basis_bar"),
         )
     if isinstance(decision, dict):
-        from pa_agent.util.trade_metrics import adjust_decision_stop_for_tp1_rr_cap
+        from pa_agent.util.trade_metrics import (
+            adjust_decision_stop_for_tp1_rr_cap,
+            decision_stop_atr_multiple,
+            NARROW_STOP_ATR_MULTIPLE,
+        )
 
         if adjust_decision_stop_for_tp1_rr_cap(decision, kline_frame=kline_frame):
             logger.debug("stop_loss widened to bring TP1 RR within program cap")
+        # 止损宽度按**这个币自己的 ATR**衡量（2026-10-12）：固定百分比对不同币不公平，
+        # 比如 RSR 的 2% 和 BTC 的 2% 完全不是一回事。这里只记录不拦单，
+        # 攒够样本再决定要不要设下限（见 docs/动态选币说明.md 第 7 节）。
+        multiple = decision_stop_atr_multiple(decision, kline_frame)
+        if multiple is not None:
+            logger.warning(
+                "计划止损宽度：%s %s 入场 %s / 止损 %s → %.2f×ATR%s",
+                getattr(kline_frame, "symbol", "") or "?",
+                getattr(kline_frame, "timeframe", "") or "?",
+                decision.get("entry_price"),
+                decision.get("stop_loss_price"),
+                multiple,
+                "（偏窄：不到 1.5×ATR，容易被噪音扫掉）"
+                if multiple < NARROW_STOP_ATR_MULTIPLE
+                else "",
+            )
     _coerce_decision_when_trade_metrics_fail(
         out,
         decision_stance=decision_stance,
