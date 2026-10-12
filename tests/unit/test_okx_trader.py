@@ -639,6 +639,22 @@ def test_cancel_stale_entries_unknown_timeframe_is_noop():
     assert client.cancelled == []
 
 
+def test_cancel_stale_entries_sweeps_all_symbols_when_inst_id_none():
+    """inst_id=None → 扫全账户，按每张单自己的品种撤（2026-10-12 修）。
+
+    背景：品种被动态换榜轮出监控列表后，原来那套"只清这一轮有结果的品种"就再也
+    碰不到它的挂单，单子会一直挂着直到成交。
+    """
+    trader, client, _market = _trader()
+    client.pending = [
+        _pending("PAAGENT", age_minutes=150, ord_id="a"),
+        {**_pending("PAAGENT", age_minutes=150, ord_id="b"), "instId": "PLUME-USDT-SWAP"},
+    ]
+    done = trader.cancel_stale_entries(None, "15m", max_bars=8)
+    assert sorted(d["ordId"] for d in done) == ["a", "b"]
+    assert sorted(client.cancelled) == [("PLUME-USDT-SWAP", "b"), ("XAU-USDT-SWAP", "a")]
+
+
 # ── 已持仓/已挂单的品种（用于跳过分析）────────────────────────────────────────
 
 def _client_with(positions, pending) -> OkxPrivateClient:

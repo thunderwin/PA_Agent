@@ -694,6 +694,23 @@ def test_cancel_stale_noop_when_disabled(monkeypatch, tmp_path):
     assert trader.cancel_stale_entries("BTC-USDT-SWAP", "1h", max_bars=0) == []
 
 
+def test_cancel_stale_sweeps_all_symbols_when_inst_id_none(monkeypatch, tmp_path):
+    """inst_id=None → 扫全账户，按每张单自己的品种撤（2026-10-12 修）。"""
+    old = 1_000_000_000_000
+    client = _FakeClient(pending=[
+        {"instId": "BTC-USDT-SWAP", "ordId": "1", "tag": "PAAGENT", "type": "LIMIT",
+         "cTime": old, "side": "buy", "sz": 1, "px": 1},
+        {"instId": "IO-USDT-SWAP", "ordId": "2", "tag": "PAAGENT", "type": "LIMIT",
+         "cTime": old, "side": "buy", "sz": 1, "px": 1},
+        {"instId": "IO-USDT-SWAP", "ordId": "3", "tag": "", "type": "LIMIT",
+         "cTime": old, "side": "buy", "sz": 1, "px": 1},        # 手动单 → 不碰
+    ])
+    trader = _trader(monkeypatch, tmp_path, client)
+    done = trader.cancel_stale_entries(None, "30m", max_bars=4)
+    assert sorted(d["ordId"] for d in done) == ["1", "2"]
+    assert sorted(client.cancelled) == [("BTC-USDT-SWAP", "1"), ("IO-USDT-SWAP", "2")]
+
+
 # ── 网关入口 / 数据源 ----------------------------------------------------------
 
 

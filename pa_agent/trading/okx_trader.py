@@ -1104,7 +1104,7 @@ class OkxTrader:
 
     def cancel_stale_entries(
         self,
-        inst_id: str,
+        inst_id: str | None,
         timeframe: str,
         *,
         max_bars: int,
@@ -1115,6 +1115,9 @@ class OkxTrader:
         等待回撤的限价单如果超过 ``max_bars`` 根 K 线还没成交，说明当初的
         回撤逻辑已经过期，继续挂着等于在形态早已改变时被"自动接刀"。
         用户手动挂的单不打我们的 tag，因此永远不会被这里撤掉。
+
+        ``inst_id=None`` 表示**扫全账户**：品种被动态换榜轮出监控列表后，
+        它的挂单也必须照常过期作废（2026-10-12 修）。
         """
         if int(max_bars or 0) <= 0:
             return []
@@ -1129,13 +1132,16 @@ class OkxTrader:
         try:
             rows = self.client.pending_orders(inst_id=inst_id)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("查询 %s 挂单失败，跳过过期清理: %s", inst_id, exc)
+            logger.warning("查询 %s 挂单失败，跳过过期清理: %s", inst_id or "全部品种", exc)
             return []
 
         cancelled: list[dict[str, Any]] = []
         for row in rows:
             if str(row.get("tag") or "") != ORDER_TAG:
                 continue                      # 不是程序下的单 → 绝不碰
+            symbol = str(row.get("instId") or inst_id or "").strip()
+            if not symbol:
+                continue                      # 认不出品种就不动（宁可留着）
             try:
                 created = int(row.get("cTime") or 0)
             except (TypeError, ValueError):
@@ -1143,14 +1149,14 @@ class OkxTrader:
             if created <= 0 or now - created < max_age_ms:
                 continue
             try:
-                self.client.cancel_order(inst_id, str(row.get("ordId")))
+                self.client.cancel_order(symbol, str(row.get("ordId")))
             except Exception as exc:  # noqa: BLE001
-                logger.warning("撤销过期挂单失败 %s %s: %s", inst_id, row.get("ordId"), exc)
+                logger.warning("撤销过期挂单失败 %s %s: %s", symbol, row.get("ordId"), exc)
                 continue
             cancelled.append(row)
             logger.warning(
                 "撤掉过期入场挂单：%s %s sz=%s 价=%s（挂了 %.0f 分钟，超过 %d 根 %s K 线）",
-                inst_id, row.get("side"), row.get("sz"), row.get("px"),
+                symbol, row.get("side"), row.get("sz"), row.get("px"),
                 (now - created) / 60_000.0, max_bars, timeframe,
             )
         return cancelled

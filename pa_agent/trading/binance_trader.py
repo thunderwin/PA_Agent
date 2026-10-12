@@ -1175,9 +1175,19 @@ class BinanceTrader:
         return row
 
     def cancel_stale_entries(
-        self, inst_id: str, timeframe: str, *, max_bars: int, now_ms: int | None = None
+        self,
+        inst_id: str | None,
+        timeframe: str,
+        *,
+        max_bars: int,
+        now_ms: int | None = None,
     ) -> list[dict[str, Any]]:
-        """撤掉超过 ``max_bars`` 根 K 线未成交的**程序**入场挂单（不碰手动单）。"""
+        """撤掉超过 ``max_bars`` 根 K 线未成交的**程序**入场挂单（不碰手动单）。
+
+        ``inst_id=None`` 表示**扫全账户**：品种被动态换榜轮出监控列表后，
+        它的挂单也必须照常过期作废（2026-10-12 修，那天 IO 的限价单就是
+        轮出监控后没人清理、超期 32 分钟才成交的）。
+        """
         if int(max_bars or 0) <= 0:
             return []
         from pa_agent.data.bar_close_wait import timeframe_to_seconds
@@ -1191,7 +1201,7 @@ class BinanceTrader:
         try:
             rows = self.client.pending_orders(inst_id=inst_id)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("查询 %s 挂单失败，跳过过期清理: %s", inst_id, exc)
+            logger.warning("查询 %s 挂单失败，跳过过期清理: %s", inst_id or "全部品种", exc)
             return []
 
         cancelled: list[dict[str, Any]] = []
@@ -1200,6 +1210,9 @@ class BinanceTrader:
                 continue                       # 不是程序下的单 → 绝不碰
             if str(row.get("type", "")).upper() in _STOP_TYPES:
                 continue                       # 止损/止盈单不按"入场挂单过期"处理
+            symbol = str(row.get("instId") or inst_id or "").strip()
+            if not symbol:
+                continue                       # 认不出品种就不动（宁可留着）
             try:
                 created = int(row.get("cTime") or 0)
             except (TypeError, ValueError):
@@ -1207,14 +1220,14 @@ class BinanceTrader:
             if created <= 0 or now - created < max_age_ms:
                 continue
             try:
-                self.client.cancel_order(inst_id, str(row.get("ordId")))
+                self.client.cancel_order(symbol, str(row.get("ordId")))
             except Exception as exc:  # noqa: BLE001
-                logger.warning("撤销过期挂单失败 %s %s: %s", inst_id, row.get("ordId"), exc)
+                logger.warning("撤销过期挂单失败 %s %s: %s", symbol, row.get("ordId"), exc)
                 continue
             cancelled.append(row)
             logger.warning(
                 "撤掉过期入场挂单：%s %s sz=%s 价=%s（挂了 %.0f 分钟，超过 %d 根 %s K 线）",
-                inst_id, row.get("side"), row.get("sz"), row.get("px"),
+                symbol, row.get("side"), row.get("sz"), row.get("px"),
                 (now - created) / 60_000.0, max_bars, timeframe,
             )
         return cancelled

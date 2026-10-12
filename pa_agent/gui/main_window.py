@@ -491,6 +491,16 @@ class MainWindow(QMainWindow):
         self._sync_submit_button_state()
         self.trade_finished.connect(self._on_trade_finished)
         self.trade_note.connect(self._on_status_update)
+        # 交易看守定时器：每 2 分钟对一次交易所侧——补挂止损体检 + 过期入场挂单清理。
+        # 这两件事以前只在"某个品种的分析结果回来"时才做，品种被动态换榜轮出监控
+        # 列表后就再没人管（2026-10-10 的裸奔事故、2026-10-12 的过期挂单事故都源于此）。
+        # 两个被调用的方法自己判断"下单是否开启"，并各自按 2 分钟节流。
+        self._last_stop_check = 0.0
+        self._last_entry_expire_check = 0.0
+        self._trade_guard_timer = QTimer(self)
+        self._trade_guard_timer.setInterval(120_000)
+        self._trade_guard_timer.timeout.connect(self._on_trade_guard_tick)
+        self._trade_guard_timer.start()
         # 无人值守监控：按设置自动开始拉数据 / 持续跟踪分析（默认关闭）
         QTimer.singleShot(1500, self._auto_start_monitoring_if_enabled)
 
@@ -4712,9 +4722,10 @@ class MainWindow(QMainWindow):
                 pass
         # 触发方式=auto 时，多品种监控出的方案直接下单（同一套闸门：以损定量/持仓/日亏…）
         self._maybe_auto_execute_watch(result)
-        # 入场挂单过期清理：超过 N 根 K 线未成交的挂单自动撤掉（只撤程序自己的单）
         symbol = str(getattr(result, "symbol", "") or "")
-        self._expire_stale_entries(symbol)
+        # 入场挂单过期清理：超过 N 根 K 线未成交的挂单自动撤掉（只撤程序自己的单）
+        # （全量扫，不看 symbol；留 symbol 是给下面的止损体检做日志用）
+        self._expire_stale_entries()
         # 止损体检：币安没有"附带止损"，成交后必须由程序补挂（OKX 只核对告警）
         self._ensure_stops(symbol)
 
@@ -4752,14 +4763,31 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=_run, name="ensure-stops", daemon=True).start()
 
-    def _expire_stale_entries(self, symbol: str) -> None:
-        """按 settings.trading.pending_entry_expiry_bars 撤掉过期的入场挂单。"""
+    def _on_trade_guard_tick(self) -> None:
+        """交易看守定时器（每 2 分钟）：补挂止损体检 + 过期入场挂单清理。"""
+        self._ensure_stops()
+        self._expire_stale_entries()
+
+    def _expire_stale_entries(self) -> None:
+        """按 settings.trading.pending_entry_expiry_bars 撤掉过期的入场挂单。
+
+        2026-10-12 修：以前只清理"这一轮有分析结果回来的那个品种"。品种一旦被动态
+        换榜轮出监控列表，那张挂单就再没人管——IO 13:44 挂的单就是这么超期 32 分钟
+        才成交、白亏 2.07 USDT 的。现在改成**全量扫交易所侧所有 PAAGENT 挂单**
+        （不依赖监控列表，和 ``_ensure_stops`` 同一套路），并按 2 分钟节流。
+        """
         trading = self._trading_settings()
-        if trading is None or not getattr(trading, "enabled", False) or not symbol:
+        if trading is None or not getattr(trading, "enabled", False):
             return
         max_bars = int(getattr(trading, "pending_entry_expiry_bars", 8) or 0)
         if max_bars <= 0:
             return
+        import time
+
+        now = time.time()
+        if now - float(getattr(self, "_last_entry_expire_check", 0.0)) < 120.0:
+            return                                  # 最多 2 分钟一次，避免刷接口
+        self._last_entry_expire_check = now
         timeframe = self._watchlist_timeframe()
         settings = self._ctx.settings
 
@@ -4770,16 +4798,22 @@ class MainWindow(QMainWindow):
 
             try:
                 trader = create_trader(settings)
-                done = trader.cancel_stale_entries(symbol, timeframe, max_bars=max_bars)
+                # inst_id=None = 扫全账户；轮出监控列表的挂单也要照常过期
+                done = trader.cancel_stale_entries(None, timeframe, max_bars=max_bars)
                 if done:
-                    self.trade_note.emit(
-                        f"已撤掉 {symbol} 的 {len(done)} 张过期入场挂单"
-                        f"（超过 {max_bars} 根 {timeframe} K 线未成交）"
+                    names = "、".join(
+                        sorted({str(r.get("instId") or "?") for r in done})
                     )
+                    note = (
+                        f"已撤掉 {len(done)} 张过期入场挂单（{names}）"
+                        f"——超过 {max_bars} 根 {timeframe} K 线未成交"
+                    )
+                    logger.warning("%s", note)
+                    self.trade_note.emit(note)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("过期挂单清理失败（%s）：%s", symbol, exc)
+                logger.warning("过期挂单清理失败：%s", exc)
 
-        threading.Thread(target=_run, name=f"okx-expire-{symbol}", daemon=True).start()
+        threading.Thread(target=_run, name="expire-stale-entries", daemon=True).start()
 
     def _maybe_auto_execute_watch(self, result: Any) -> None:
         trading = self._trading_settings()

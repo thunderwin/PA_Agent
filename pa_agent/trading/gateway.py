@@ -213,9 +213,17 @@ class TradingGateway(Protocol):
         """市价平掉该品种全部持仓（并撤掉该品种的挂单）。"""
 
     def cancel_stale_entries(
-        self, inst_id: str, timeframe: str, *, max_bars: int, now_ms: int | None = None
+        self,
+        inst_id: str | None,
+        timeframe: str,
+        *,
+        max_bars: int,
+        now_ms: int | None = None,
     ) -> list[dict[str, Any]]:
-        """撤掉超过 ``max_bars`` 根 K 线未成交的**程序**入场挂单。"""
+        """撤掉超过 ``max_bars`` 根 K 线未成交的**程序**入场挂单。
+
+        ``inst_id=None`` = 扫全账户（品种被换榜轮出监控列表也要照常过期）。
+        """
 
     def ensure_stops(self, inst_id: str | None = None) -> list[str]:
         """给"有持仓但没止损"的程序仓位补挂止损，返回处理说明。
