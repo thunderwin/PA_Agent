@@ -427,8 +427,9 @@ class _WatchlistWorker(QThread):
 class MainWindow(QMainWindow):
     """Top-level workbench: chart + AI sidebar (analysis / raw / decision)."""
 
-    #: 后台线程完成一次 OKX 下单后回到 UI 线程报告结果。
-    trade_finished = pyqtSignal(object)
+    #: 后台下单线程回到 UI 线程的回执：(执行结果, 品种)。
+    #: 带上品种，自动下单日志才能分辨是哪一笔。
+    trade_finished = pyqtSignal(object, object)
     #: 后台线程的其它交易事件（如撤掉过期挂单）→ 状态栏。
     trade_note = pyqtSignal(str)
 
@@ -4821,7 +4822,7 @@ class MainWindow(QMainWindow):
                     )
                 except Exception as exc:  # noqa: BLE001
                     outcome = exc
-            self.trade_finished.emit(outcome)
+            self.trade_finished.emit(outcome, symbol)
 
         threading.Thread(target=_run, name=f"okx-auto-{symbol}", daemon=True).start()
 
@@ -4941,12 +4942,14 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "无法下单", str(exc))
             else:
                 self._status_bar.showMessage(f"自动下单跳过：{exc}")
+                logger.warning("自动下单未执行：%s %s", symbol, exc)
             return
         except TradeError as exc:
             if interactive:
                 QMessageBox.critical(self, "交易所接口错误", str(exc))
             else:
                 self._status_bar.showMessage(f"自动下单失败：{exc}")
+                logger.warning("自动下单失败：%s %s", symbol, exc)
             return
         except Exception as exc:  # noqa: BLE001
             logger.exception("下单预演失败")
@@ -4959,6 +4962,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "无法下单", preview.message)
             else:
                 self._status_bar.showMessage(f"自动下单跳过：{preview.message}")
+                logger.warning("自动下单未执行：%s %s", symbol, preview.message)
             return
 
         simulated = bool(getattr(trader.credentials, "simulated", True))
@@ -5018,38 +5022,44 @@ class MainWindow(QMainWindow):
                 )
             except Exception as exc:  # noqa: BLE001
                 result = exc
-            self.trade_finished.emit(result)
+            self.trade_finished.emit(result, symbol)
 
         threading.Thread(target=_run, name="okx-order", daemon=True).start()
 
-    def _on_trade_finished(self, result: Any) -> None:
-        """下单线程结果回到 UI 线程。"""
+    def _on_trade_finished(self, result: Any, symbol: Any = "") -> None:
+        """下单线程结果回到 UI 线程；``symbol`` 用于日志里标明是哪个品种。"""
         from pa_agent.trading.okx_trader import ExecutionResult
 
         interactive = bool(getattr(self, "_last_trade_interactive", True))
+        name = str(symbol or "").strip()
+        tag = f"{name} " if name else ""
         self._update_execute_button_state()
 
         if isinstance(result, ExecutionResult):
             if result.sent:
-                self._status_bar.showMessage(f"已下单：{result.message}｜订单号 {result.ord_id}")
+                self._status_bar.showMessage(
+                    f"已下单：{tag}{result.message}｜订单号 {result.ord_id}"
+                )
                 if not interactive:
-                    logger.warning("自动下单成功：%s｜订单号 %s", result.message, result.ord_id)
+                    logger.warning(
+                        "自动下单成功：%s%s｜订单号 %s", tag, result.message, result.ord_id
+                    )
                 if interactive:
                     QMessageBox.information(
                         self, "下单成功", f"{result.message}\n\n订单号：{result.ord_id}"
                     )
             else:
-                self._status_bar.showMessage(f"下单未执行：{result.message}")
+                self._status_bar.showMessage(f"下单未执行：{tag}{result.message}")
                 if not interactive:
-                    logger.warning("自动下单未执行：%s", result.message)
+                    logger.warning("自动下单未执行：%s%s", tag, result.message)
                 if interactive:
                     QMessageBox.warning(self, "下单未执行", result.message)
             return
 
         message = str(result)
-        self._status_bar.showMessage(f"下单失败：{message}")
+        self._status_bar.showMessage(f"下单失败：{tag}{message}")
         if not interactive:
-            logger.warning("自动下单失败：%s", message)
+            logger.warning("自动下单失败：%s%s", tag, message)
         if interactive:
             QMessageBox.critical(self, "下单失败", message)
 
