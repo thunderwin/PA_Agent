@@ -85,8 +85,14 @@ def format_estimated_win_rate_reasoning(decision: dict[str, Any]) -> str:
 
 # Lower cap: reward must be at least equal to risk (1:1) for any stance.
 MIN_RISK_REWARD_RATIO = 1.0
-# Upper cap on TP1 reward:risk — enforced by widening stop, not by shrinking TP1.
-MAX_TP1_RISK_REWARD_RATIO = 1.0
+# Upper cap on TP1 reward:risk. ``None`` = 不设上限。
+#
+# 2026-10-12 改成 None（用户要求）：**AI 决定的止损位置绝不能被程序改写**。
+# 以前这里是 1.0，效果是"盈亏比高于 1:1 就把止损往外撑到 1:1"——RSR 那笔的
+# 结构止损 0.002265（2.79%）就是这样被撑成 0.002164（7.12%）的，而且静默发生
+# （只写 debug 日志）。止盈由 trading.risk_reward_ratio 统一覆盖（当前 1:3），
+# 与 AI 自己写的 TP1 无关，所以这个上限既没必要也有害。
+MAX_TP1_RISK_REWARD_RATIO: float | None = None
 
 
 def min_risk_reward_ratio(decision_stance: str | None = None) -> float:
@@ -107,22 +113,31 @@ def widen_stop_for_tp1_rr_cap(
     direction: object,
     *,
     tick: float | None = None,
+    cap: float | None = None,
 ) -> float | None:
-    """Move stop outward so TP1 RR <= MAX_TP1_RISK_REWARD_RATIO (entry/TP unchanged).
+    """Move stop outward so TP1 RR <= cap (entry/TP unchanged).
 
     Long: lower stop; short: raise stop. Returns None if geometry cannot be fixed.
+
+    ``cap`` 缺省取 :data:`MAX_TP1_RISK_REWARD_RATIO`；**当前它是 None，
+    也就是"不撑止损"，函数直接把原止损原样返回**（2026-10-12 用户要求：
+    AI 定的止损不可被程序改写）。传 ``cap=1.0`` 之类可以复现旧行为。
     """
     import math
+
+    limit = MAX_TP1_RISK_REWARD_RATIO if cap is None else float(cap)
+    if limit is None or limit <= 0:
+        return stop_loss                      # 不设上限 → 止损原样不动
 
     rr = compute_risk_reward(entry, take_profit, stop_loss, direction)
     if rr is None:
         return None
     ratio = float(rr["ratio"])
-    if ratio <= MAX_TP1_RISK_REWARD_RATIO + 1e-9:
+    if ratio <= limit + 1e-9:
         return stop_loss
 
     reward = float(rr["reward"])
-    min_risk = reward / MAX_TP1_RISK_REWARD_RATIO
+    min_risk = reward / limit
     long = is_long_direction(direction)
     t = tick if tick and tick > 0 else 0.0
     min_rr = MIN_RISK_REWARD_RATIO
@@ -162,7 +177,7 @@ def widen_stop_for_tp1_rr_cap(
             cand_ratio = _ratio_for_stop(candidate)
             if cand_ratio is None:
                 continue
-            if cand_ratio < min_rr - 1e-9 or cand_ratio > MAX_TP1_RISK_REWARD_RATIO + 1e-9:
+            if cand_ratio < min_rr - 1e-9 or cand_ratio > limit + 1e-9:
                 continue
             if best_ratio is None or cand_ratio > best_ratio:
                 best = candidate
@@ -190,7 +205,7 @@ def widen_stop_for_tp1_rr_cap(
             cand_ratio = _ratio_for_stop(candidate)
             if cand_ratio is None:
                 continue
-            if cand_ratio < min_rr - 1e-9 or cand_ratio > MAX_TP1_RISK_REWARD_RATIO + 1e-9:
+            if cand_ratio < min_rr - 1e-9 or cand_ratio > limit + 1e-9:
                 continue
             if best_ratio is None or cand_ratio > best_ratio:
                 best = candidate
@@ -204,8 +219,14 @@ def adjust_decision_stop_for_tp1_rr_cap(
     *,
     kline_frame: Any = None,
     tick: float | None = None,
+    cap: float | None = None,
 ) -> bool:
-    """Widen stop_loss_price in-place when TP1 RR exceeds the program cap."""
+    """Widen stop_loss_price in-place when TP1 RR exceeds the program cap.
+
+    **程序已不再调用它**（2026-10-12 用户要求：AI 定的止损不可被改写；
+    :data:`MAX_TP1_RISK_REWARD_RATIO` 现在是 None，所以即使调用也不会改动）。
+    保留函数是为了让旧测试/外部调用显式传 ``cap=`` 时仍能复现旧行为。
+    """
     if decision.get("order_type") not in ("限价单", "突破单", "市价单"):
         return False
     try:
@@ -221,7 +242,7 @@ def adjust_decision_stop_for_tp1_rr_cap(
         tick = infer_price_tick_from_frame(kline_frame)
 
     new_sl = widen_stop_for_tp1_rr_cap(
-        entry, tp, sl, decision.get("order_direction"), tick=tick
+        entry, tp, sl, decision.get("order_direction"), tick=tick, cap=cap
     )
     if new_sl is None or abs(new_sl - sl) < 1e-12:
         return False

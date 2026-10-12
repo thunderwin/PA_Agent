@@ -1579,13 +1579,12 @@ def normalize_stage2(
         )
     if isinstance(decision, dict):
         from pa_agent.util.trade_metrics import (
-            adjust_decision_stop_for_tp1_rr_cap,
             decision_stop_atr_multiple,
             NARROW_STOP_ATR_MULTIPLE,
         )
 
-        if adjust_decision_stop_for_tp1_rr_cap(decision, kline_frame=kline_frame):
-            logger.debug("stop_loss widened to bring TP1 RR within program cap")
+        # 2026-10-12 起**不再**按盈亏比上限去撑止损：AI 定的止损位置一个字都不改，
+        # 仓位大小由「以损定量」控制，止盈由 trading.risk_reward_ratio 统一覆盖。
         # 止损宽度按**这个币自己的 ATR**衡量（2026-10-12）：固定百分比对不同币不公平，
         # 比如 RSR 的 2% 和 BTC 的 2% 完全不是一回事。这里只记录不拦单，
         # 攒够样本再决定要不要设下限（见 docs/动态选币说明.md 第 7 节）。

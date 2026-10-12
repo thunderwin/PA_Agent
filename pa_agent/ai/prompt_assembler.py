@@ -480,15 +480,14 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 - `decision_trace[10.3].reason` 中的入场/止损/目标数字必须与 `decision` 三价一致（勿用未写入 decision 的中间价）
 - 做多：风险点数 = entry − stop，回报点数 = take_profit_price − entry；做空：风险 = stop − entry，回报 = entry − take_profit_price
 - 盈亏比 = 回报 ÷ 风险（程序与界面只认此公式；reasoning 中写的 RR 必须与三价一致，否则校验失败）
-- **无盈亏比上限（模型侧）**：按结构自由定 entry / TP1 / TP2 / stop；**禁止**为凑 RR 而缩小 TP1 或贴噪音止损。程序会在 RR>1.0 时自动向外扩 stop（保持 TP1/TP2 不变）。
+- **止损由结构定，程序不改**：按结构自由定 entry / TP1 / TP2 / stop；**禁止**为凑 RR 而缩小 TP1 或贴噪音止损。**程序一个字都不会改你写的 stop_loss_price**（2026-10-12 起），仓位大小由「以损定量」自动换算。止盈价由程序按设置的固定盈亏比覆盖（当前 **1:3**），所以你写的 TP1/TP2 只用于 §10.3 校验与结构说明。
 - **定价顺序（推荐）**：
   1. 定 **entry**（结构位/边界/回撤位或突破极值±跳动）
   2. 定 **take_profit_price（TP1）** 于最近有效结构目标（通道对边、区间对侧、前 swing 等）
   3. 定 **take_profit_price_2（TP2）** 于更远结构目标（Measured Move、通道对边远端、区间翻测等）
   4. 定 **stop_loss_price** 于结构失效位（信号棒/波段极点外 1 跳等）
-  5. 若按结构 stop 算得 RR = 回报÷风险 **> 1.0**：**保持 TP1/TP2 不变**；程序校验时会自动向外扩 stop（模型也可先自行扩 stop）
-  6. 若结构 stop 已是最宽合理位且 RR 仍 > 1.0：程序会自动扩 stop；只要 §10.3 交易者方程通过即可
-  7. 若结构 stop 导致 RR < 1.0：优先**收紧** stop 至更近的结构失效位，或调整 entry；**禁止**向外扩 stop；仍无法 ≥1.0 → reject
+  5. 若按结构 stop 算得 RR = 回报÷风险 **> 1.0**：正常，**保持 TP1/TP2/stop 不变**，程序不会动它们（也没有 RR 上限）
+  6. 若结构 stop 导致 RR < 1.0：优先**收紧** stop 至更近的结构失效位，或调整 entry；**禁止**向外扩 stop；仍无法 ≥1.0 → reject
 - **TP1 / TP2 硬规则**：
   - 有下单时 `take_profit_price` 与 `take_profit_price_2` **均必填**；不下单时均为 null
   - 做多：stop < entry < take_profit_price < take_profit_price_2
@@ -1926,7 +1925,8 @@ class PromptAssembler:
             "- 若无强信号棒：§9.0=否，**必须** 继续写 **§9.0P** 并尝试背景限价三价。",
             "- §9.0P=是：signal_bar.bar=null、quality=invalid；entry_bar pending；"
             "三价写入 decision，不要只在 watch_points 写触发条件。",
-            "- 定价：先定结构 TP1/TP2，再定结构 stop；RR>1.0 时程序自动向外扩 stop（保持 TP 不变）。",
+            "- 定价：先定结构 TP1/TP2，再定结构 stop；RR≥1.0、无上限——"
+            "程序**不会**改你写的 stop（仓位由以损定量换算，止盈由程序按 1:3 覆盖）。",
         ]
         if near_support is not None:
             lines.append(

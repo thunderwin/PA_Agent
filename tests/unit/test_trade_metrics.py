@@ -34,12 +34,14 @@ def test_compute_risk_reward_short():
 def test_rr_bounds_all_stances_share_one_floor() -> None:
     for stance in ("conservative", "balanced", "aggressive", "extreme_aggressive", None):
         assert min_risk_reward_ratio(stance) == 1.0
-    assert max_risk_reward_ratio() == 1.0
+    # 2026-10-12：上限取消（None）——AI 定的止损不許被程序改写
+    assert max_risk_reward_ratio() is None
 
 
 def test_widen_stop_for_tp1_rr_cap_long():
     # entry=100, tp=110, stop=99 -> risk=1, reward=10, RR=10
-    widened = widen_stop_for_tp1_rr_cap(100.0, 110.0, 99.0, "做多", tick=0.01)
+    # 显式给 cap=1.0 才复现旧行为（程序默认不再撑止损）
+    widened = widen_stop_for_tp1_rr_cap(100.0, 110.0, 99.0, "做多", tick=0.01, cap=1.0)
     assert widened is not None
     assert widened < 99.0
     rr = compute_risk_reward(100.0, 110.0, widened, "做多")
@@ -48,7 +50,7 @@ def test_widen_stop_for_tp1_rr_cap_long():
 
 
 def test_widen_stop_for_tp1_rr_cap_short():
-    widened = widen_stop_for_tp1_rr_cap(100.0, 90.0, 101.0, "做空", tick=0.01)
+    widened = widen_stop_for_tp1_rr_cap(100.0, 90.0, 101.0, "做空", tick=0.01, cap=1.0)
     assert widened is not None
     assert widened > 101.0
     rr = compute_risk_reward(100.0, 90.0, widened, "做空")
@@ -64,7 +66,7 @@ def test_adjust_decision_stop_for_tp1_rr_cap_mutates_decision():
         "take_profit_price": 110.0,
         "stop_loss_price": 99.0,
     }
-    assert adjust_decision_stop_for_tp1_rr_cap(decision, tick=0.01)
+    assert adjust_decision_stop_for_tp1_rr_cap(decision, tick=0.01, cap=1.0)
     rr = compute_risk_reward(
         decision["entry_price"],
         decision["take_profit_price"],
@@ -73,6 +75,23 @@ def test_adjust_decision_stop_for_tp1_rr_cap_mutates_decision():
     )
     assert rr is not None
     assert rr["ratio"] <= 1.0
+
+
+def test_stop_is_never_widened_by_default() -> None:
+    """2026-10-12 用户要求：AI 定的止损位置一个字都不能改。"""
+    decision = {
+        "order_type": "限价单",
+        "order_direction": "做多",
+        "entry_price": 0.00233,
+        "take_profit_price": 0.002496,      # RR = 166/65 ≈ 2.55
+        "stop_loss_price": 0.002265,
+    }
+    assert adjust_decision_stop_for_tp1_rr_cap(decision, tick=1e-6) is False
+    assert decision["stop_loss_price"] == pytest.approx(0.002265)
+    # 直接调底层也不会动：默认 cap=None
+    assert widen_stop_for_tp1_rr_cap(
+        0.00233, 0.002496, 0.002265, "做多", tick=1e-6
+    ) == pytest.approx(0.002265)
 
 
 def test_format_estimated_win_rate_from_model_field():

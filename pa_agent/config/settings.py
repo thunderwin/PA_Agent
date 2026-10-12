@@ -199,7 +199,9 @@ class TradingSettings(BaseModel):
     #: 单笔名义额上限（USDT）；0 = 不限制。触顶时自动缩量——实际风险只会更小，不会更大。
     max_notional_usd: float = Field(default=0.0, ge=0.0, le=1_000_000)
     #: 固定盈亏比（0 = 用 AI 的止盈价）。>0 时按 入场 ± 比值×止损距离 重算止盈。
-    risk_reward_ratio: float = Field(default=2.5, ge=0.0, le=100.0)
+    #: 固定止盈盈亏比：>0 时忽略 AI 给的止盈价，按 止盈=入场±N×止损距离 重算。
+    #: 2026-10-12 用户定为 3.0（1:3）；止损**不会被程序改写**，仓位由以损定量控制。
+    risk_reward_ratio: float = Field(default=3.0, ge=0.0, le=100.0)
     #: 是否把止盈一并挂到交易所。
     #: False（默认）= 只挂止损，止盈由人工了结；True = 恢复"止损+止盈一起托管"。
     attach_take_profit: bool = True
