@@ -89,6 +89,9 @@ _STOP_TYPES = (
     "TRAILING_STOP_MARKET",
 )
 
+#: 只算"止盈"的类型（2026-10-14：止盈一直没补挂上，见 ensure_stops 的说明）。
+_TP_TYPES = ("TAKE_PROFIT", "TAKE_PROFIT_MARKET")
+
 
 def sign_query(secret_key: str, query: str) -> str:
     """币安签名：``hex(hmac_sha256(secret, query_string))``。
@@ -1083,51 +1086,86 @@ class BinanceTrader:
             if abs(amount) <= 0:
                 continue
             try:
-                if self._has_stop_order(symbol):
-                    continue
+                has_stop = self._has_stop_order(symbol)
             except BinanceTradeError as exc:
                 notes.append(f"{symbol} 止损失败核对：{exc}")
                 continue
-            stop_px = _as_float((intents.get(symbol) or {}).get("stop_px"))
-            if not stop_px:
-                stop_px = self._safety_stop_px(
-                    _as_float(rows[0].get("avgPx")) or 0.0, amount
-                )
-                if stop_px is None:
-                    notes.append(
-                        f"⚠️ {symbol} 有持仓但没有止损，也算不出安全距离"
-                        "（可能仓位过小），请手动处理"
-                    )
-                    logger.warning("⚠️ %s 有持仓但无止损且算不出安全距离，请手动补挂", symbol)
-                    continue
-                logger.warning(
-                    "⚠️ %s 有持仓但无止损意图记录，按「每笔最多亏 %.2f USDT」自动补挂 %.8g",
-                    symbol,
-                    float(getattr(self._settings, "max_loss_per_trade_usd", 0.0)),
-                    stop_px,
-                )
-                intents[symbol] = {
-                    "stop_px": stop_px, "size": abs(amount),
-                    "side": "buy" if amount > 0 else "sell", "filled": True,
-                    "ts": int(time.time() * 1000), "note": "程序兜底补挂",
-                }
-                _save_stop_intents(intents)
+            intent = intents.get(symbol) or {}
             side = "sell" if amount > 0 else "buy"
-            try:
-                spec = self.spec_for(symbol)
-                self.client.place_stop(
-                    inst_id=symbol,
-                    side=side,
-                    stop_px=stop_px,
-                    size=abs(amount),
-                    tick=spec.tick_sz,
-                    step=spec.lot_sz,
-                )
-                notes.append(f"{symbol} 已补挂止损（触发价 {stop_px}）")
-                logger.warning("补挂止损成功：%s 触发价 %s", symbol, stop_px)
-            except (BinanceTradeError, TradeRejected) as exc:
-                notes.append(f"⚠️ {symbol} 补挂止损失败：{exc}")
-                logger.warning("补挂止损失败 %s：%s", symbol, exc)
+            spec = None
+
+            # ① 止损
+            if not has_stop:
+                stop_px = _as_float(intent.get("stop_px"))
+                if not stop_px:
+                    stop_px = self._safety_stop_px(
+                        _as_float(rows[0].get("avgPx")) or 0.0, amount
+                    )
+                    if stop_px is None:
+                        notes.append(
+                            f"⚠️ {symbol} 有持仓但没有止损，也算不出安全距离"
+                            "（可能仓位过小），请手动处理"
+                        )
+                        logger.warning(
+                            "⚠️ %s 有持仓但无止损且算不出安全距离，请手动补挂", symbol
+                        )
+                        continue
+                    logger.warning(
+                        "⚠️ %s 有持仓但无止损意图记录，按「每笔最多亏 %.2f USDT」"
+                        "自动补挂 %.8g",
+                        symbol,
+                        float(getattr(self._settings, "max_loss_per_trade_usd", 0.0)),
+                        stop_px,
+                    )
+                    intents[symbol] = {
+                        "stop_px": stop_px, "size": abs(amount),
+                        "side": side, "filled": True,
+                        "ts": int(time.time() * 1000), "note": "程序兜底补挂",
+                    }
+                    _save_stop_intents(intents)
+                try:
+                    spec = spec or self.spec_for(symbol)
+                    self.client.place_stop(
+                        inst_id=symbol,
+                        side=side,
+                        stop_px=stop_px,
+                        size=abs(amount),
+                        tick=spec.tick_sz,
+                        step=spec.lot_sz,
+                    )
+                    notes.append(f"{symbol} 已补挂止损（触发价 {stop_px}）")
+                    logger.warning("补挂止损成功：%s 触发价 %s", symbol, stop_px)
+                except (BinanceTradeError, TradeRejected) as exc:
+                    notes.append(f"⚠️ {symbol} 补挂止损失败：{exc}")
+                    logger.warning("补挂止损失败 %s：%s", symbol, exc)
+
+            # ② 止盈（2026-10-14 修）：限价单成交后原来只补止损，**止盈从来没挂上过**
+            # （历史日志里 "止盈已挂" 出现 0 次）。止盈价来自意图记录，只在
+            # attach_take_profit 打开、且该记录确实有 take_profit_px 时才补。
+            tp_px = _as_float(intent.get("take_profit_px")) or 0.0
+            if bool(getattr(self._settings, "attach_take_profit", False)) and tp_px > 0:
+                try:
+                    has_tp = self._has_take_profit_order(symbol)
+                except BinanceTradeError as exc:
+                    notes.append(f"{symbol} 止盈核对失败：{exc}")
+                    has_tp = True          # 查不到就别重复挂
+                if not has_tp:
+                    try:
+                        spec = spec or self.spec_for(symbol)
+                        self.client.place_stop(
+                            inst_id=symbol,
+                            side=side,
+                            stop_px=tp_px,
+                            size=abs(amount),
+                            tick=spec.tick_sz,
+                            step=spec.lot_sz,
+                            kind="take_profit",
+                        )
+                        notes.append(f"{symbol} 已补挂止盈（触发价 {tp_px}）")
+                        logger.warning("补挂止盈成功：%s 触发价 %s", symbol, tp_px)
+                    except (BinanceTradeError, TradeRejected) as exc:
+                        notes.append(f"⚠️ {symbol} 补挂止盈失败：{exc}")
+                        logger.warning("补挂止盈失败 %s：%s", symbol, exc)
         return notes
 
     def _safety_stop_px(self, entry_px: float, amount: float) -> float | None:
@@ -1149,6 +1187,16 @@ class BinanceTrader:
                 return True
         for row in self.client.pending_orders(inst_id=symbol):
             if str(row.get("type", "")).upper() in ("STOP_MARKET", "STOP"):
+                return True
+        return False
+
+    def _has_take_profit_order(self, symbol: str) -> bool:
+        """该品种是否已有止盈单（Algo 条件单 + 普通挂单都查，2026-10-14 加）。"""
+        for row in self.client.algo_pending(inst_id=symbol):
+            if str(row.get("type", "")).upper() in _TP_TYPES:
+                return True
+        for row in self.client.pending_orders(inst_id=symbol):
+            if str(row.get("type", "")).upper() in _TP_TYPES:
                 return True
         return False
 

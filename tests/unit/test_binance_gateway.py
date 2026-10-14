@@ -649,6 +649,65 @@ def test_ensure_stops_warns_without_intent(monkeypatch, tmp_path):
     assert client.placed_stops == []
 
 
+# 2026-10-14 修：限价单成交后 ensure_stops 只补止损，止盈**从来没挂上过**
+# （历史日志里 "止盈已挂" 出现 0 次；DEEP 持仓就只有一张 STOP_MARKET）。
+
+
+def test_ensure_stops_also_attaches_take_profit(monkeypatch, tmp_path):
+    (tmp_path / "intents.json").write_text(
+        json.dumps({"BTC-USDT-SWAP": {
+            "stop_px": 84000.0, "size": 0.002, "side": "buy",
+            "take_profit_px": 86000.0, "filled": False,
+        }}),
+        encoding="utf-8",
+    )
+    client = _FakeClient(positions=[{"instId": "BTC-USDT-SWAP", "pos": 0.002}])
+    trader = _trader(monkeypatch, tmp_path, client, attach_take_profit=True)
+    notes = trader.ensure_stops("BTC-USDT-SWAP")
+    assert [s.get("kind", "stop") for s in client.placed_stops] == ["stop", "take_profit"]
+    assert client.placed_stops[1]["stop_px"] == 86000.0
+    assert any("已补挂止盈" in n for n in notes), notes
+
+
+def test_ensure_stops_does_not_duplicate_take_profit(monkeypatch, tmp_path):
+    (tmp_path / "intents.json").write_text(
+        json.dumps({"BTC-USDT-SWAP": {
+            "stop_px": 84000.0, "size": 0.002, "side": "buy",
+            "take_profit_px": 86000.0,
+        }}),
+        encoding="utf-8",
+    )
+    client = _FakeClient(
+        positions=[{"instId": "BTC-USDT-SWAP", "pos": 0.002}],
+        algo=[{"instId": "BTC-USDT-SWAP", "type": "TAKE_PROFIT_MARKET", "ordId": "6"}],
+    )
+    trader = _trader(monkeypatch, tmp_path, client, attach_take_profit=True)
+    trader.ensure_stops("BTC-USDT-SWAP")
+    assert [s.get("kind", "stop") for s in client.placed_stops] == ["stop"]        # 只补止损
+
+
+def test_ensure_stops_skips_take_profit_when_disabled(monkeypatch, tmp_path):
+    (tmp_path / "intents.json").write_text(
+        json.dumps({"BTC-USDT-SWAP": {
+            "stop_px": 84000.0, "take_profit_px": 86000.0,
+        }}),
+        encoding="utf-8",
+    )
+    client = _FakeClient(positions=[{"instId": "BTC-USDT-SWAP", "pos": 0.002}])
+    trader = _trader(monkeypatch, tmp_path, client)      # attach_take_profit=False
+    trader.ensure_stops("BTC-USDT-SWAP")
+    assert [s.get("kind", "stop") for s in client.placed_stops] == ["stop"]
+
+
+def test_ensure_stops_leaves_manual_position_without_take_profit(monkeypatch, tmp_path):
+    """兜底补挂的意图记录没有止盈价（那是手动开的仓）→ 只补止损，不加止盈。"""
+    client = _FakeClient(positions=[{"instId": "BTC-USDT-SWAP", "pos": 0.002,
+                                     "avgPx": 85000.0}])
+    trader = _trader(monkeypatch, tmp_path, client, attach_take_profit=True)
+    trader.ensure_stops("BTC-USDT-SWAP")
+    assert [s.get("kind", "stop") for s in client.placed_stops] == ["stop"]
+
+
 def test_ensure_stops_forgets_closed_position(monkeypatch, tmp_path):
     (tmp_path / "intents.json").write_text(
         json.dumps({"BTC-USDT-SWAP": {"stop_px": 84000.0}}), encoding="utf-8"
