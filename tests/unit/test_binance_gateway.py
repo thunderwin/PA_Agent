@@ -721,6 +721,35 @@ def test_ensure_stops_forgets_closed_position(monkeypatch, tmp_path):
 # ── 过期撤单 ──────────────────────────────────────────────────────────────────
 
 
+def test_private_parse_raises_clear_error_on_451_region_block():
+    """2026-10-18：451 的响应体 code=0，旧逻辑当成成功 → 上层炸成
+    'str' object has no attribute 'get'，真实原因被掩盖。"""
+    client = BinancePrivateClient(
+        BinanceCredentials("KEY123456789", "SECRET", simulated=False)
+    )
+    with pytest.raises(BinanceTradeError) as err:
+        client._parse(
+            451,
+            json.dumps({"code": 0, "msg": "Service unavailable from a restricted location"}),
+        )
+    assert "451" in str(err.value)
+    assert "地区限制" in str(err.value)
+
+
+def test_private_parse_keeps_business_error_for_timestamp_retry():
+    """code=-1021 仍要原样返回，request() 才能"对时后重试一次"。"""
+    client = BinancePrivateClient(
+        BinanceCredentials("KEY123456789", "SECRET", simulated=False)
+    )
+    payload = client._parse(
+        400,
+        json.dumps(
+            {"code": -1021, "msg": "Timestamp for this request is outside of the recvWindow."}
+        ),
+    )
+    assert payload["code"] == -1021
+
+
 def test_cancel_stale_only_touches_tagged_entries(monkeypatch, tmp_path):
     old = 1_000_000_000_000
     client = _FakeClient(pending=[

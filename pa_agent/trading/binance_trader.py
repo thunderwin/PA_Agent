@@ -359,10 +359,24 @@ class BinancePrivateClient:
             raise BinanceTradeError(
                 f"币安返回内容不是 JSON（HTTP {status}）：{text[:160]}"
             ) from exc
-        if status != 200 and not (
-            isinstance(payload, dict) and payload.get("code") is not None
-        ):
-            raise BinanceTradeError(f"币安 HTTP {status}: {text[:200]}")
+        # 2026-10-18 修：451（地区限制）的响应体是 ``{"code": 0, "msg": "Service
+        # unavailable from a restricted location..."}`` —— ``code`` 是 0，旧逻辑把它
+        # 当成"成功响应"返回，上层拿 dict 当 list 迭代就炸成
+        # ``'str' object has no attribute 'get'``，真正的 451 原因被完全掩盖。
+        # 现在：非 200 且 code 不是业务错误码（None/0/200）→ 直接报 HTTP 错误；
+        # code=-1021 之类的业务错误仍然返回给 request()，保留"对时后重试一次"逻辑。
+        if status != 200:
+            code = payload.get("code") if isinstance(payload, dict) else None
+            if code in (None, 0, "0", 200, "200"):
+                msg = (
+                    payload.get("msg")
+                    if isinstance(payload, dict)
+                    else str(payload)[:160]
+                )
+                hint = "（该出口 IP 被地区限制，需要换代理节点）" if status == 451 else ""
+                raise BinanceTradeError(
+                    f"币安 HTTP {status}: {msg or text[:160]}{hint}"
+                )
         return payload
 
     def _raise_for_error(self, payload: Any) -> None:
