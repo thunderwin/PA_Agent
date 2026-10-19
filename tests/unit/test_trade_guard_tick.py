@@ -93,3 +93,39 @@ def test_expire_is_throttled(window, monkeypatch):
     window._expire_stale_entries()          # 2 分钟内第二次 → 直接返回
     time.sleep(0.2)
     assert len(fake.sweeps) == 1
+
+
+def test_watchlist_watchdog_restarts_dead_worker(window, monkeypatch):
+    """2026-10-18 事故：监控线程启动时探活失败就永久退出，空了 20 小时。
+    看门狗必须把它拉起来。"""
+    calls: list[int] = []
+    monkeypatch.setattr(window, "_restart_watchlist_worker", lambda: calls.append(1))
+    window._ctx.settings.general.watch_enabled = True
+    window._watchlist_worker = None
+
+    window._ensure_watchlist_worker_running()
+    assert calls == [1]
+
+
+def test_watchlist_watchdog_leaves_running_worker_alone(window, monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(window, "_restart_watchlist_worker", lambda: calls.append(1))
+    window._ctx.settings.general.watch_enabled = True
+
+    class _Running:
+        def isRunning(self):
+            return True
+
+    window._watchlist_worker = _Running()
+    window._ensure_watchlist_worker_running()
+    assert calls == []
+
+
+def test_watchlist_watchdog_noop_when_disabled(window, monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(window, "_restart_watchlist_worker", lambda: calls.append(1))
+    window._ctx.settings.general.watch_enabled = False
+    window._watchlist_worker = None
+
+    window._ensure_watchlist_worker_running()
+    assert calls == []

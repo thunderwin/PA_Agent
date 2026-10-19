@@ -381,8 +381,11 @@ class _WatchlistWorker(QThread):
         try:
             _new_source()          # 先探一次，数据源不可用就早点报错
         except Exception as exc:   # noqa: BLE001
-            self.status_update.emit(f"多品种监控无法启动：{exc}")
-            return
+            # 2026-10-18 事故：启动瞬间正好被币安 451 挡住，这里直接 return，
+            # 线程永久退出；网络恢复后也没人再拉起它，程序空了 20 小时没做分析。
+            # 现在只告警、不退出：主循环每轮会自己重试取数，网络恢复即自动接上。
+            self.status_update.emit(f"多品种监控首次探活失败（稍后自动重试）：{exc}")
+            logger.warning("多品种监控首次探活失败，继续重试：%s", exc)
 
         previous: dict[tuple[str, str], int] = {}
         skip_symbols: set[str] = set()
@@ -506,6 +509,12 @@ class MainWindow(QMainWindow):
         self._trade_guard_timer.setInterval(120_000)
         self._trade_guard_timer.timeout.connect(self._on_trade_guard_tick)
         self._trade_guard_timer.start()
+        # 监控看门狗：watch_enabled 但监控线程不在跑（启动时网络故障 / 线程异常退出）
+        # 就每 60 秒尝试拉起一次（2026-10-18 事故：空转 20 小时没人发现）。
+        self._watchlist_watchdog = QTimer(self)
+        self._watchlist_watchdog.setInterval(60_000)
+        self._watchlist_watchdog.timeout.connect(self._ensure_watchlist_worker_running)
+        self._watchlist_watchdog.start()
         # 无人值守监控：按设置自动开始拉数据 / 持续跟踪分析（默认关闭）
         QTimer.singleShot(1500, self._auto_start_monitoring_if_enabled)
 
@@ -4627,6 +4636,28 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             logger.debug("停止多品种监控失败: %s", exc)
         self._watchlist_worker = None
+
+    def _ensure_watchlist_worker_running(self) -> None:
+        """看门狗：watch_enabled 时保证多品种监控线程在跑（2026-10-19 加）。
+
+        2026-10-18 事故：启动那一刻币安正被 451 挡住，`_WatchlistWorker` 首次探活
+        失败后直接退出；之后网络恢复也没人再拉起它，程序整整 20 小时没做过分析。
+        这里每 60 秒兜底一次：线程不在跑就重启。
+        """
+        if not self._ui_is_alive() or getattr(self, "_demo_mode", False):
+            return
+        general = getattr(getattr(self._ctx, "settings", None), "general", None)
+        if general is None or not getattr(general, "watch_enabled", False):
+            return
+        worker = getattr(self, "_watchlist_worker", None)
+        try:
+            running = bool(worker is not None and worker.isRunning())
+        except RuntimeError:                 # 底层 QThread 已被销毁
+            running = False
+        if running:
+            return
+        logger.warning("多品种监控线程不在运行（watch_enabled=True），看门狗自动重启")
+        self._restart_watchlist_worker()
 
     def _restart_watchlist_worker(self) -> None:
         """按当前设置（重新）启动多品种监控线程。"""
