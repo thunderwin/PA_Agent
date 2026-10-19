@@ -530,6 +530,28 @@ def stop_atr_multiple(entry: object, stop_loss: object, atr: object) -> float | 
     return distance / a
 
 
+def market_entry_reject_reason(
+    price: object, stop_loss: object, direction: object
+) -> str | None:
+    """市价「直接入场」前检查：现价是否已经越过结构止损。
+
+    返回 None = 可以入场；返回字符串 = 拒绝原因。
+    """
+    try:
+        p = float(price)
+        s = float(stop_loss)
+    except (TypeError, ValueError):
+        return "价格或止损无效"
+    if p <= 0 or s <= 0:
+        return "价格或止损无效"
+    long = is_long_direction(direction)
+    if long is True and p <= s:
+        return f"现价 {p:.8g} 已跌破止损 {s:.8g}"
+    if long is False and p >= s:
+        return f"现价 {p:.8g} 已涨破止损 {s:.8g}"
+    return None
+
+
 def decision_stop_atr_multiple(
     decision: Any, kline_frame: Any
 ) -> float | None:

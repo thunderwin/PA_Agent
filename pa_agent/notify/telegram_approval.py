@@ -233,11 +233,15 @@ class TelegramApprovalService:
                         except Exception as exc:  # noqa: BLE001
                             logger.warning("处理 Telegram 按钮失败：%s", exc)
                     continue
-                if action not in ("exec", "skip") or not plan_id:
+                if action not in ("exec", "skip", "market") or not plan_id:
                     continue
                 self._answer_callback(
                     str(cq.get("id") or ""),
-                    "已收到，执行中…" if action == "exec" else "已跳过",
+                    {
+                        "exec": "已收到，正在挂单…",
+                        "market": "已收到，按市价入场…",
+                        "skip": "已跳过",
+                    }.get(action, "已收到"),
                 )
                 try:
                     self._on_action(plan_id, action)

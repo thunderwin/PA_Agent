@@ -4991,6 +4991,7 @@ class MainWindow(QMainWindow):
             stop = float(getattr(plan, "stop_px", 0.0) or 0.0)
             tp = float(getattr(plan, "take_profit_px", 0.0) or 0.0)
             stop_pct = abs(entry - stop) / entry * 100 if entry else 0.0
+            price_now = 0.0
             caption = (
                 f"🔔 <b>{symbol}</b>（{timeframe}）出现交易机会\n"
                 f"方向：<b>{direction}</b> · {order_type}\n"
@@ -5009,6 +5010,8 @@ class MainWindow(QMainWindow):
                 from pa_agent.notify.chart_image import render_kline_png
 
                 bars = self._fetch_chart_bars(symbol, timeframe)
+                if bars:
+                    price_now = float(getattr(bars[0], "close", 0) or 0)
                 image_path = os.path.join(
                     tempfile.gettempdir(), f"pa_chart_{symbol.split('-')[0]}_{int(_time.time())}.png"
                 )
@@ -5026,14 +5029,23 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("生成 K 线图失败：%s", exc)
                 image_path = ""
+            if price_now > 0:
+                caption = caption.replace(
+                    f"置信度：{confidence}",
+                    f"现价：<code>{price_now:.8g}</code>\n置信度：{confidence}",
+                )
             plan_id = f"{symbol}:{int(_time.time())}"
             self._pending_tg_plans[plan_id] = {
                 "decision": dict(decision),
                 "symbol": symbol,
                 "price": entry or None,
+                "price_now": price_now,
                 "expire_ts": _time.time() + timeout_min * 60,
             }
-            rows = [[("✅ 执行", f"exec:{plan_id}"), ("❌ 跳过", f"skip:{plan_id}")]]
+            rows = [
+                [("✅ 按计划挂单", f"exec:{plan_id}"), ("⚡ 直接入场", f"market:{plan_id}")],
+                [("❌ 跳过", f"skip:{plan_id}")],
+            ]
             try:
                 if image_path:
                     tg.send_photo(caption, image_path, rows)
@@ -5056,13 +5068,14 @@ class MainWindow(QMainWindow):
             self._tg_reply(f"{plan.get('symbol')} 的提醒已过期，未下单。")
             return
         symbol = str(plan.get("symbol") or "")
-        if action != "exec":
+        if action not in ("exec", "market"):
             logger.warning("Telegram：用户跳过 %s", symbol)
             self._tg_reply(f"已跳过 {symbol}。")
             return
         settings = self._ctx.settings
         decision = plan["decision"]
         price = plan.get("price")
+        market_entry = action == "market"
 
         import threading
 
@@ -5072,9 +5085,42 @@ class MainWindow(QMainWindow):
             from pa_agent.trading.gateway import create_trader
 
             try:
+                use_decision = dict(decision)
+                price_arg = price
+                if market_entry:
+                    # 直接入场：用当前价市价成交，止损仍用 AI 给的结构位
+                    from pa_agent.data.factory import create_data_source
+
+                    current = float(plan.get("price_now") or 0.0)
+                    if current <= 0:
+                        src = create_data_source(self._current_data_source_kind())
+                        try:
+                            src.connect()
+                            src.subscribe(symbol, self._watchlist_timeframe())
+                            bars = src.latest_snapshot(2)
+                            current = float(getattr(bars[0], "close", 0) or 0)
+                        finally:
+                            try:
+                                src.disconnect()
+                            except Exception:  # noqa: BLE001
+                                pass
+                    stop_px = float(use_decision.get("stop_loss_price") or 0.0)
+                    if current <= 0:
+                        raise RuntimeError("拿不到当前价，无法直接入场")
+                    from pa_agent.util.trade_metrics import market_entry_reject_reason
+
+                    reject = market_entry_reject_reason(
+                        current, stop_px, use_decision.get("order_direction")
+                    )
+                    if reject:
+                        raise RuntimeError(f"{reject}，方案已失效，不能直接入场")
+                    use_decision["order_type"] = "市价单"
+                    use_decision["entry_price"] = current
+                    use_decision["entry_rule"] = "用户选择直接入场（市价）"
+                    price_arg = current
                 trader = create_trader(settings)
                 outcome: Any = trader.execute(
-                    decision, symbol=symbol, dry_run=False, manual_confirm=False, price=price
+                    use_decision, symbol=symbol, dry_run=False, manual_confirm=False, price=price_arg
                 )
             except Exception as exc:  # noqa: BLE001
                 outcome = exc
@@ -5085,7 +5131,10 @@ class MainWindow(QMainWindow):
                 if tg is not None:
                     sent = bool(getattr(outcome, "sent", False))
                     msg = str(getattr(outcome, "message", outcome))
-                    head = "✅ <b>已下单</b>" if sent else "❌ <b>下单未执行</b>"
+                    if sent:
+                        head = "⚡ <b>已按市价入场</b>" if market_entry else "✅ <b>已下单</b>"
+                    else:
+                        head = "❌ <b>下单未执行</b>"
                     tg.send_html(f"{head}\n{symbol}\n{msg}")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Telegram 下单回执发送失败：%s", exc)
@@ -5112,7 +5161,11 @@ class MainWindow(QMainWindow):
                 "/positions — 查看持仓\n"
                 "/close <品种> — 平掉某个仓位（如 /close BTC）\n"
                 "/closeall — 一键全部平仓（需再确认）\n"
-                "/testalert — 发一条测试提醒（带 K 线图，不会下单）"
+                "/testalert — 发一条测试提醒（带 K 线图，不会下单）\n\n"
+                "提醒里的按钮：\n"
+                "✅ 按计划挂单（AI 的限价，等回撤）\n"
+                "⚡ 直接入场（按现价市价成交，止损照带）\n"
+                "❌ 跳过"
             )
         elif cmd in ("/positions", "/pos"):
             self._tg_send_positions()

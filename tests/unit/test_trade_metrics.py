@@ -147,3 +147,23 @@ def test_decision_stop_atr_multiple_only_for_executable_plans():
 
 def test_narrow_stop_reference_line_is_documented_value():
     assert NARROW_STOP_ATR_MULTIPLE == pytest.approx(1.5)
+
+
+# ── 市价「直接入场」合法性（2026-10-19 加）──────────────────────────────────
+
+
+def test_market_entry_rejected_when_price_crossed_stop():
+    from pa_agent.util.trade_metrics import market_entry_reject_reason
+
+    # 做空：现价已经涨破止损 → 不能直接入场
+    assert market_entry_reject_reason(4175.0, 4174.3, "做空") is not None
+    # 做多：现价已经跌破止损 → 不能直接入场
+    assert market_entry_reject_reason(78000.0, 78400.0, "做多") is not None
+
+
+def test_market_entry_allowed_when_stop_still_valid():
+    from pa_agent.util.trade_metrics import market_entry_reject_reason
+
+    assert market_entry_reject_reason(4154.7, 4174.3, "做空") is None
+    assert market_entry_reject_reason(80000.0, 78400.0, "做多") is None
+    assert market_entry_reject_reason(0, 100, "做多") is not None
