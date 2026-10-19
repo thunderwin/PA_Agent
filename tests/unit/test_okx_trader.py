@@ -911,3 +911,24 @@ def test_plan_order_without_ratio_keeps_ai_take_profit():
         BTC_SWAP, equity_usd=10_000.0, max_loss_usd=10.0, leverage=10,
     )
     assert plan.take_profit_px == pytest.approx(85300.0)
+
+
+# ── 每笔风险按账户百分比（2026-10-19 用户要求 0.5%）─────────────────────────
+
+
+def test_effective_max_loss_uses_pct_of_equity():
+    from pa_agent.trading.okx_trader import effective_max_loss_usd
+
+    s = SimpleNamespace(max_loss_per_trade_pct=0.5, max_loss_per_trade_usd=2.0)
+    assert effective_max_loss_usd(s, 1917.72) == pytest.approx(9.5886, rel=1e-4)
+    assert effective_max_loss_usd(s, 40.0) == pytest.approx(0.2)
+
+
+def test_effective_max_loss_falls_back_to_fixed_usd():
+    from pa_agent.trading.okx_trader import effective_max_loss_usd
+
+    s = SimpleNamespace(max_loss_per_trade_pct=0.0, max_loss_per_trade_usd=2.0)
+    assert effective_max_loss_usd(s, 1917.72) == pytest.approx(2.0)
+    # 百分比开着但权益读不到 → 退回固定金额，避免算出 0 风险
+    s2 = SimpleNamespace(max_loss_per_trade_pct=0.5, max_loss_per_trade_usd=2.0)
+    assert effective_max_loss_usd(s2, 0.0) == pytest.approx(2.0)

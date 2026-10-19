@@ -569,6 +569,19 @@ def _round_to_tick(value: float, tick: float) -> float:
     return round(round(value / tick) * tick, 10)
 
 
+def effective_max_loss_usd(settings: Any, equity_usd: float) -> float:
+    """每笔风险预算：配置了百分比就按当前权益算，否则用固定 USDT。
+
+    2026-10-19 用户要求："不再控制固定止损，而是按照账号百分比"（例如 0.5%）。
+    注意：这只决定**仓位大小**（以损定量），止损价仍然是 AI 给的结构位，不会被改。
+    """
+    pct = float(getattr(settings, "max_loss_per_trade_pct", 0.0) or 0.0)
+    fixed = float(getattr(settings, "max_loss_per_trade_usd", 10.0) or 10.0)
+    if pct > 0 and equity_usd and equity_usd > 0:
+        return equity_usd * pct / 100.0
+    return fixed
+
+
 def plan_order(
     decision: dict[str, Any],
     spec: InstrumentSpec,
@@ -906,10 +919,15 @@ class OkxTrader:
             return "交易：关闭"
         if self._cred is None or not self._cred.complete:
             return "交易：已开启但缺少 API 凭据"
-        mode = "自动" if getattr(s, "trigger_mode", "manual") == "auto" else "手动"
+        mode = {
+            "auto": "自动",
+            "notify": "通知确认",
+        }.get(str(getattr(s, "trigger_mode", "manual")), "手动")
         venue = "模拟盘" if self._cred.simulated else "实盘"
+        pct = float(getattr(s, "max_loss_per_trade_pct", 0.0) or 0.0)
         cap = float(getattr(s, "max_loss_per_trade_usd", 0.0))
-        return f"交易：{venue} · {mode} · 每笔上限 {cap:.0f} USDT"
+        risk = f"每笔 {pct:g}% 权益" if pct > 0 else f"每笔上限 {cap:.0f} USDT"
+        return f"交易：{venue} · {mode} · {risk}"
 
     # ── 主流程 ────────────────────────────────────────────────────────────────
 
@@ -983,11 +1001,12 @@ class OkxTrader:
             )
 
         spec = self.spec_for(symbol)
+        equity = self.client.equity_usd()
         plan = plan_order(
             decision,
             spec,
-            equity_usd=self.client.equity_usd(),
-            max_loss_usd=float(getattr(s, "max_loss_per_trade_usd", 10.0)),
+            equity_usd=equity,
+            max_loss_usd=effective_max_loss_usd(s, equity),
             leverage=int(getattr(s, "leverage", 3)),
             price=price,
             max_notional_usd=float(getattr(s, "max_notional_usd", 0.0) or 0.0),

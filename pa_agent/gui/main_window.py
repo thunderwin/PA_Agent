@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from typing import Any
 
@@ -440,6 +441,8 @@ class MainWindow(QMainWindow):
     trade_finished = pyqtSignal(object, object)
     #: 后台线程的其它交易事件（如撤掉过期挂单）→ 状态栏。
     trade_note = pyqtSignal(str)
+    #: Telegram 按钮回调（plan_id, exec|skip）—— 从轮询线程回到 UI 线程执行。
+    telegram_action = pyqtSignal(str, str)
 
     def __init__(self, ctx: AppContext, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -515,6 +518,11 @@ class MainWindow(QMainWindow):
         self._watchlist_watchdog.setInterval(60_000)
         self._watchlist_watchdog.timeout.connect(self._ensure_watchlist_worker_running)
         self._watchlist_watchdog.start()
+        # Telegram 交易提醒 + 人工确认（trigger_mode=notify 时生效）
+        self._pending_tg_plans: dict[str, dict[str, Any]] = {}
+        self._telegram: Any = None
+        self.telegram_action.connect(self._on_telegram_trade_action)
+        self._init_telegram()
         # 无人值守监控：按设置自动开始拉数据 / 持续跟踪分析（默认关闭）
         QTimer.singleShot(1500, self._auto_start_monitoring_if_enabled)
 
@@ -4855,7 +4863,8 @@ class MainWindow(QMainWindow):
         trading = self._trading_settings()
         if trading is None or not getattr(trading, "enabled", False):
             return
-        if str(getattr(trading, "trigger_mode", "manual")) != "auto":
+        mode = str(getattr(trading, "trigger_mode", "manual"))
+        if mode not in ("auto", "notify"):
             return
         if getattr(self, "_demo_mode", False) or self._analysis_in_progress:
             return
@@ -4866,6 +4875,9 @@ class MainWindow(QMainWindow):
             return
         symbol = str(getattr(result, "symbol", "") or "")
         if not symbol:
+            return
+        if mode == "notify":
+            self._notify_trade_opportunity(result)
             return
 
         import threading
@@ -4895,6 +4907,304 @@ class MainWindow(QMainWindow):
             self.trade_finished.emit(outcome, symbol)
 
         threading.Thread(target=_run, name=f"okx-auto-{symbol}", daemon=True).start()
+
+    # ── Telegram：交易提醒 + 人工确认 + 持仓命令 ─────────────────────────────
+
+    def _init_telegram(self) -> None:
+        settings = getattr(self._ctx, "settings", None)
+        tg = getattr(settings, "telegram", None)
+        if tg is None or not getattr(tg, "enabled", False):
+            return
+        if not (getattr(tg, "bot_token", "") and getattr(tg, "chat_id", "")):
+            logger.warning("Telegram 已启用但 bot_token/chat_id 为空，跳过")
+            return
+        from pa_agent.notify.telegram_approval import TelegramApprovalService
+
+        proxy = (
+            os.environ.get("PA_TELEGRAM_PROXY")
+            or os.environ.get("PA_PROXY_URL")
+            or os.environ.get("PA_BINANCE_PROXY")
+        )
+        try:
+            self._telegram = TelegramApprovalService(
+                str(tg.bot_token),
+                str(tg.chat_id),
+                proxy=proxy,
+                on_action=lambda pid, act: self.telegram_action.emit(pid, act),
+                on_command=self._on_telegram_command,
+                on_callback=self._on_telegram_callback,
+            )
+            self._telegram.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Telegram 初始化失败：%s", exc)
+
+    def _fetch_chart_bars(self, symbol: str, timeframe: str) -> list[Any]:
+        """取最近 100 根 K 线（用于 Telegram 图片）。"""
+        from pa_agent.data.factory import create_data_source
+
+        kind = self._current_data_source_kind()
+        src = create_data_source(kind)
+        try:
+            src.connect()
+            src.subscribe(symbol, timeframe)
+            return list(src.latest_snapshot(100))
+        finally:
+            try:
+                src.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _notify_trade_opportunity(self, result: Any) -> None:
+        """trigger_mode=notify：发 Telegram（带图 + 执行/跳过按钮），不直接下单。"""
+        tg = getattr(self, "_telegram", None)
+        decision = getattr(result, "decision", None)
+        symbol = str(getattr(result, "symbol", "") or "")
+        timeframe = str(getattr(result, "timeframe", "") or self._watchlist_timeframe())
+        if tg is None or not isinstance(decision, dict) or not symbol:
+            logger.warning("Telegram 未就绪，跳过本次通知：%s", symbol)
+            return
+        settings = self._ctx.settings
+        timeout_min = int(
+            getattr(getattr(settings, "telegram", None), "approval_timeout_min", 30) or 30
+        )
+
+        import threading
+        import time as _time
+
+        def _run() -> None:
+            from pa_agent.trading.gateway import create_trader
+
+            try:
+                trader = create_trader(settings)
+                preview = trader.execute(decision, symbol=symbol, dry_run=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("生成通知前预演失败 %s：%s", symbol, exc)
+                return
+            plan = getattr(preview, "plan", None)
+            if plan is None:
+                logger.warning("Telegram 提醒跳过：%s %s", symbol, getattr(preview, "message", ""))
+                return
+            confidence = getattr(result, "confidence", None)
+            direction = str(decision.get("order_direction") or "")
+            order_type = str(decision.get("order_type") or "")
+            entry = float(getattr(plan, "price", 0.0) or 0.0)
+            stop = float(getattr(plan, "stop_px", 0.0) or 0.0)
+            tp = float(getattr(plan, "take_profit_px", 0.0) or 0.0)
+            stop_pct = abs(entry - stop) / entry * 100 if entry else 0.0
+            caption = (
+                f"🔔 <b>{symbol}</b>（{timeframe}）出现交易机会\n"
+                f"方向：<b>{direction}</b> · {order_type}\n"
+                f"入场：<code>{entry:.8g}</code>\n"
+                f"止损：<code>{stop:.8g}</code>（距入场 {stop_pct:.2f}%）\n"
+                f"止盈：<code>{tp:.8g}</code>（1:3）\n"
+                f"数量：{getattr(plan, 'size', 0):.8g} · 名义 {getattr(plan, 'notional_usd', 0):.2f} USDT\n"
+                f"风险：<b>{getattr(plan, 'risk_usd', 0):.2f} USDT</b>\n"
+                f"置信度：{confidence}\n"
+                f"⏳ {timeout_min} 分钟内有效"
+            )
+            image_path = ""
+            try:
+                import tempfile
+
+                from pa_agent.notify.chart_image import render_kline_png
+
+                bars = self._fetch_chart_bars(symbol, timeframe)
+                image_path = os.path.join(
+                    tempfile.gettempdir(), f"pa_chart_{symbol.split('-')[0]}_{int(_time.time())}.png"
+                )
+                levels = [
+                    (entry, "入场", "#f5c542"),
+                    (stop, "止损", "#ef5350"),
+                    (tp, "止盈", "#26a69a"),
+                ]
+                if not render_kline_png(
+                    bars, image_path,
+                    title=f"{symbol} {timeframe}  |  最近 {len(bars)} 根 + EMA20",
+                    levels=levels,
+                ):
+                    image_path = ""
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("生成 K 线图失败：%s", exc)
+                image_path = ""
+            plan_id = f"{symbol}:{int(_time.time())}"
+            self._pending_tg_plans[plan_id] = {
+                "decision": dict(decision),
+                "symbol": symbol,
+                "price": entry or None,
+                "expire_ts": _time.time() + timeout_min * 60,
+            }
+            rows = [[("✅ 执行", f"exec:{plan_id}"), ("❌ 跳过", f"skip:{plan_id}")]]
+            try:
+                if image_path:
+                    tg.send_photo(caption, image_path, rows)
+                else:
+                    tg.send_keyboard(caption, rows)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Telegram 发送失败：%s", exc)
+
+        threading.Thread(target=_run, name=f"tg-notify-{symbol}", daemon=True).start()
+
+    def _on_telegram_trade_action(self, plan_id: str, action: str) -> None:
+        """用户点了「执行 / 跳过」（已回到 UI 线程）。"""
+        import time as _time
+
+        plan = self._pending_tg_plans.pop(plan_id, None)
+        if not plan:
+            self._tg_reply("这条提醒已失效。")
+            return
+        if _time.time() > float(plan.get("expire_ts", 0)):
+            self._tg_reply(f"{plan.get('symbol')} 的提醒已过期，未下单。")
+            return
+        symbol = str(plan.get("symbol") or "")
+        if action != "exec":
+            logger.warning("Telegram：用户跳过 %s", symbol)
+            self._tg_reply(f"已跳过 {symbol}。")
+            return
+        settings = self._ctx.settings
+        decision = plan["decision"]
+        price = plan.get("price")
+
+        import threading
+
+        self._last_trade_interactive = False
+
+        def _run() -> None:
+            from pa_agent.trading.gateway import create_trader
+
+            try:
+                trader = create_trader(settings)
+                outcome: Any = trader.execute(
+                    decision, symbol=symbol, dry_run=False, manual_confirm=False, price=price
+                )
+            except Exception as exc:  # noqa: BLE001
+                outcome = exc
+            self.trade_finished.emit(outcome, symbol)
+
+        threading.Thread(target=_run, name=f"tg-exec-{symbol}", daemon=True).start()
+
+    def _tg_reply(self, text: str) -> None:
+        tg = getattr(self, "_telegram", None)
+        if tg is None:
+            return
+        import threading
+
+        threading.Thread(target=lambda: tg.send_text(text), daemon=True).start()
+
+    def _on_telegram_command(self, text: str) -> None:
+        """Telegram 命令（在轮询线程里调用；只做网络/日志，不碰 UI）。"""
+        parts = str(text or "").strip().split()
+        if not parts:
+            return
+        cmd = parts[0].lower().split("@")[0]
+        if cmd in ("/start", "/help"):
+            self._tg_reply(
+                "可用命令：\n"
+                "/positions — 查看持仓\n"
+                "/close <品种> — 平掉某个仓位（如 /close BTC）\n"
+                "/closeall — 一键全部平仓（需再确认）"
+            )
+        elif cmd in ("/positions", "/pos"):
+            self._tg_send_positions()
+        elif cmd == "/close":
+            if len(parts) < 2:
+                self._tg_reply("用法：/close BTC")
+                return
+            self._tg_close_symbol(parts[1])
+        elif cmd == "/closeall":
+            if getattr(self, "_telegram", None) is not None:
+                self._telegram.send_keyboard(
+                    "⚠️ 确定要平掉<b>全部仓位</b>吗？",
+                    [[("🔴 确认全部平仓", "closeall:confirm"), ("取消", "closeall:cancel")]],
+                )
+        else:
+            self._tg_reply("未知命令。发送 /help 查看可用命令。")
+
+    def _tg_send_positions(self) -> None:
+        settings = self._ctx.settings
+        try:
+            from pa_agent.trading.gateway import create_trader
+
+            trader = create_trader(settings)
+            equity = float(trader.client.equity_usd() or 0.0)
+            positions = list(trader.client.positions() or [])
+        except Exception as exc:  # noqa: BLE001
+            self._tg_reply(f"读取持仓失败：{exc}")
+            return
+        if not positions:
+            self._tg_reply(f"当前空仓。\n权益：{equity:.2f} USDT")
+            return
+        lines = [f"📊 <b>当前持仓</b>（权益 {equity:.2f} USDT）"]
+        rows: list[list[tuple[str, str]]] = []
+        for p in positions:
+            sym = str(p.get("instId") or "")
+            qty = float(p.get("pos") or 0)
+            avg = float(p.get("avgPx") or 0)
+            upl = float(p.get("upl") or 0)
+            lever = p.get("lever")
+            side = "多" if qty > 0 else "空"
+            lines.append(
+                f"• <b>{sym}</b> {side} {abs(qty):.8g} @ {avg:.8g}"
+                f" · 浮盈 {upl:+.2f} USDT" + (f" · {lever}x" if lever else "")
+            )
+            rows.append([(f"平仓 {sym.split('-')[0]}", f"close:{sym}")])
+        if getattr(self, "_telegram", None) is not None:
+            self._telegram.send_keyboard("\n".join(lines), rows)
+
+    def _tg_close_symbol(self, query: str) -> None:
+        q = str(query or "").strip().upper()
+        settings = self._ctx.settings
+        try:
+            from pa_agent.trading.gateway import create_trader
+
+            trader = create_trader(settings)
+            positions = list(trader.client.positions() or [])
+            target = None
+            for p in positions:
+                sym = str(p.get("instId") or "")
+                if sym == q or sym.split("-")[0] == q:
+                    target = sym
+                    break
+            if target is None:
+                self._tg_reply(f"没找到 {q} 的持仓。发送 /positions 查看。")
+                return
+            trader.close_position(target)
+            self._tg_reply(f"已市价平掉 {target}。")
+        except Exception as exc:  # noqa: BLE001
+            self._tg_reply(f"平仓 {q} 失败：{exc}")
+
+    def _on_telegram_callback(self, data: str) -> None:
+        action, _, arg = str(data or "").partition(":")
+        if action == "close":
+            self._tg_close_symbol(arg)
+        elif action == "closeall" and arg == "confirm":
+            self._tg_close_all()
+        elif action == "closeall":
+            self._tg_reply("已取消。")
+
+    def _tg_close_all(self) -> None:
+        settings = self._ctx.settings
+        try:
+            from pa_agent.trading.gateway import create_trader
+
+            trader = create_trader(settings)
+            positions = list(trader.client.positions() or [])
+            if not positions:
+                self._tg_reply("当前没有持仓。")
+                return
+            done, failed = [], []
+            for p in positions:
+                sym = str(p.get("instId") or "")
+                try:
+                    trader.close_position(sym)
+                    done.append(sym)
+                except Exception as exc:  # noqa: BLE001
+                    failed.append(f"{sym}: {exc}")
+            text = f"已平仓 {len(done)} 个：{', '.join(done) or '—'}"
+            if failed:
+                text += "\n失败：" + "; ".join(failed)
+            self._tg_reply(text)
+        except Exception as exc:  # noqa: BLE001
+            self._tg_reply(f"全部平仓失败：{exc}")
 
     def _on_watchlist_symbol_activated(self, symbol: str, timeframe: str) -> None:
         """双击监控表某一行 → 主图表切到该品种。"""

@@ -139,6 +139,7 @@ class OkxTradingDialog(QDialog):
         self._trigger_combo = QComboBox()
         self._trigger_combo.addItem("手动确认（分析完等你点「执行下单」）", "manual")
         self._trigger_combo.addItem("自动触发（新 K 线收盘后自动下单）", "auto")
+        self._trigger_combo.addItem("Telegram 确认（发图 + 执行/跳过按钮）", "notify")
         mode_form.addRow("触发方式:", self._trigger_combo)
 
         root.addWidget(mode_group)

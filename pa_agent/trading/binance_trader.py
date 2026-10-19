@@ -52,6 +52,7 @@ from pa_agent.trading.gateway import (
     OrderPlan,
     TradeError,
     TradeRejected,
+    effective_max_loss_usd,
     evaluate_guard,
     from_binance_symbol,
     plan_order,
@@ -842,10 +843,15 @@ class BinanceTrader:
             return "交易：关闭"
         if self._cred is None or not self._cred.complete:
             return "交易：已开启但缺少币安 API 凭据"
-        mode = "自动" if getattr(s, "trigger_mode", "manual") == "auto" else "手动"
+        mode = {
+            "auto": "自动",
+            "notify": "通知确认",
+        }.get(str(getattr(s, "trigger_mode", "manual")), "手动")
         venue = "测试网" if self._cred.simulated else "实盘"
+        pct = float(getattr(s, "max_loss_per_trade_pct", 0.0) or 0.0)
         cap = float(getattr(s, "max_loss_per_trade_usd", 0.0))
-        return f"交易：币安{venue} · {mode} · 每笔上限 {cap:.0f} USDT"
+        risk = f"每笔 {pct:g}% 权益" if pct > 0 else f"每笔上限 {cap:.0f} USDT"
+        return f"交易：币安{venue} · {mode} · {risk}"
 
     # ── 合约规格 ──────────────────────────────────────────────────────────────
 
@@ -955,11 +961,12 @@ class BinanceTrader:
             )
 
         spec = self.spec_for(symbol)
+        equity = self.client.equity_usd()
         plan = plan_order(
             decision,
             spec,
-            equity_usd=self.client.equity_usd(),
-            max_loss_usd=float(getattr(s, "max_loss_per_trade_usd", 10.0)),
+            equity_usd=equity,
+            max_loss_usd=effective_max_loss_usd(s, equity),
             leverage=int(getattr(s, "leverage", 3)),
             price=price,
             max_notional_usd=float(getattr(s, "max_notional_usd", 0.0) or 0.0),
@@ -1187,7 +1194,11 @@ class BinanceTrader:
 
         币安 ``positionAmt`` 就是标的币数量，所以：亏损 = |数量| × 价格距离。
         """
-        cap = float(getattr(self._settings, "max_loss_per_trade_usd", 0.0) or 0.0)
+        try:
+            equity = float(self.client.equity_usd() or 0.0)
+        except Exception:  # noqa: BLE001
+            equity = 0.0
+        cap = effective_max_loss_usd(self._settings, equity)
         if cap <= 0 or entry_px <= 0 or abs(amount) <= 0:
             return None
         distance = cap / abs(amount)

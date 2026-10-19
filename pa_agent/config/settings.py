@@ -192,10 +192,15 @@ class TradingSettings(BaseModel):
     simulated: bool = True
     #: 实盘风险确认：simulated=False 时必须为 True，否则拒绝下单（防止误切实盘）。
     live_ack: bool = False
-    #: manual = 分析完只提示，等你点「执行下单」；auto = 新 K 线收盘后自动下单。
-    trigger_mode: Literal["manual", "auto"] = "manual"
+    #: manual = 分析完只提示，等你点「执行下单」；
+    #: auto = 新 K 线收盘后自动下单；
+    #: notify = 发 Telegram 通知带「执行/跳过」按钮，你点了我才下单（2026-10-19 加）。
+    trigger_mode: Literal["manual", "auto", "notify"] = "manual"
     #: 每笔最大亏损（USDT）。用 入场价与止损价的距离 反推下单量，超出即拒单。
     max_loss_per_trade_usd: float = Field(default=10.0, gt=0, le=10_000)
+    #: 每笔风险按账户权益的百分比算（0 = 关闭，用上面的固定 USDT）。
+    #: 2026-10-19 用户要求：0.5% × 当前权益，代替固定金额；止损价本身仍是结构位。
+    max_loss_per_trade_pct: float = Field(default=0.0, ge=0.0, le=100.0)
     #: 单笔名义额上限（USDT）；0 = 不限制。触顶时自动缩量——实际风险只会更小，不会更大。
     max_notional_usd: float = Field(default=0.0, ge=0.0, le=1_000_000)
     #: 固定盈亏比（0 = 用 AI 的止盈价）。>0 时按 入场 ± 比值×止损距离 重算止盈。
@@ -268,6 +273,22 @@ class PushPlusSettings(BaseModel):
     token: str = ""
 
 
+class TelegramSettings(BaseModel):
+    """Telegram 交易提醒 + 人工确认（2026-10-19 加）。
+
+    ``trigger_mode=notify`` 时，出现可下单方案不会直接下单，而是发一条带
+    「✅ 执行 / ❌ 跳过」按钮的消息；只有收到你点按钮的回调才真正下单。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    bot_token: str = ""
+    chat_id: str = ""
+    #: 待确认方案的有效期（分钟），过期后按钮失效、不会下单。
+    approval_timeout_min: int = Field(default=30, ge=1, le=1440)
+
+
 class Settings(BaseModel):
     """Root settings object persisted to config/settings.json."""
     model_config = ConfigDict(extra="ignore")
@@ -278,6 +299,7 @@ class Settings(BaseModel):
     validation: ValidationSettings = Field(default_factory=ValidationSettings)
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
     pushplus: PushPlusSettings = Field(default_factory=PushPlusSettings)
+    telegram: TelegramSettings = Field(default_factory=TelegramSettings)
     tushare: TushareSettings = Field(default_factory=TushareSettings)
     trading: TradingSettings = Field(default_factory=TradingSettings)
 
