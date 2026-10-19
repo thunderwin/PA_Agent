@@ -5086,7 +5086,7 @@ class MainWindow(QMainWindow):
                     sent = bool(getattr(outcome, "sent", False))
                     msg = str(getattr(outcome, "message", outcome))
                     head = "✅ <b>已下单</b>" if sent else "❌ <b>下单未执行</b>"
-                    tg.send_text(f"{head}\n{symbol}\n{msg}")
+                    tg.send_html(f"{head}\n{symbol}\n{msg}")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Telegram 下单回执发送失败：%s", exc)
 

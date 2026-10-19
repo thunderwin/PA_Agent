@@ -91,6 +91,18 @@ class TelegramApprovalService:
             {"chat_id": self._chat_id, "text": text, "disable_web_page_preview": "true"},
         ) is not None
 
+    def send_html(self, text: str) -> bool:
+        """发纯文本消息，但按 HTML 解析（<b>/<code> 等）。"""
+        return self._call(
+            "sendMessage",
+            {
+                "chat_id": self._chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "true",
+            },
+        ) is not None
+
     def send_keyboard(self, text: str, rows: list[list[tuple[str, str]]]) -> bool:
         """发一条带自定义按钮的消息：rows = [[(label, callback_data), ...], ...]."""
         markup = {
