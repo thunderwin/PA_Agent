@@ -55,8 +55,8 @@ def render_kline_png(
     *,
     title: str = "",
     ema_period: int = 20,
-    width: int = 1280,
-    height: int = 620,
+    width: int = 1600,
+    height: int = 1200,
     levels: Sequence[tuple[float, str, str]] = (),
 ) -> bool:
     """画图并保存 PNG。``bars`` 新旧顺序都行（按 ts_open 自动排序）。返回是否成功。"""
@@ -87,7 +87,7 @@ def render_kline_png(
     pad = (hi - lo) * 0.06 or max(hi * 0.01, 1e-8)
     lo, hi = lo - pad, hi + pad
 
-    left, right, top, bottom = 14, 96, 42, 34
+    left, right, top, bottom = 18, 120, 56, 46
     plot_w = max(width - left - right, 10)
     plot_h = max(height - top - bottom, 10)
     step = plot_w / len(clean)
@@ -105,20 +105,20 @@ def render_kline_png(
     try:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(QPen(QColor(_TEXT), 1))
-        painter.setFont(QFont("Helvetica", 11))
+        painter.setFont(QFont("Helvetica", 14))
         if title:
-            painter.setFont(QFont("Helvetica", 13, QFont.Weight.Bold))
-            painter.drawText(QRectF(left, 8, width - left - right, 26), Qt.AlignmentFlag.AlignLeft, title)
+            painter.setFont(QFont("Helvetica", 19, QFont.Weight.Bold))
+            painter.drawText(QRectF(left, 12, width - left - right, 34), Qt.AlignmentFlag.AlignLeft, title)
 
         # 网格 + 价格刻度（5 档）
-        painter.setFont(QFont("Helvetica", 10))
+        painter.setFont(QFont("Helvetica", 13))
         for i in range(1, 5):
             price = lo + (hi - lo) * i / 5
             y = y_of(price)
             painter.setPen(QPen(QColor(_GRID), 1, Qt.PenStyle.DashLine))
             painter.drawLine(QPointF(left, y), QPointF(width - right, y))
             painter.setPen(QPen(QColor(_TEXT), 1))
-            painter.drawText(QRectF(width - right + 6, y - 9, right - 8, 18),
+            painter.drawText(QRectF(width - right + 8, y - 11, right - 10, 22),
                              Qt.AlignmentFlag.AlignLeft, f"{price:.6g}")
 
         # 蜡烛
@@ -146,36 +146,36 @@ def render_kline_png(
             prev = point
 
         # 入场/止损/止盈线
-        painter.setFont(QFont("Helvetica", 10, QFont.Weight.Bold))
+        painter.setFont(QFont("Helvetica", 14, QFont.Weight.Bold))
         for price, label, color in levels:
             if not price or price <= 0:
                 continue
             y = y_of(price)
             painter.setPen(QPen(QColor(color), 1.4, Qt.PenStyle.DashLine))
             painter.drawLine(QPointF(left, y), QPointF(width - right, y))
-            painter.drawText(QRectF(left + 6, y - 17, 260, 16),
+            painter.drawText(QRectF(left + 8, y - 24, 340, 20),
                              Qt.AlignmentFlag.AlignLeft, f"{label} {price:.6g}")
 
         # 时间刻度（最旧 / 中间 / 最新）
         painter.setPen(QPen(QColor(_TEXT), 1))
-        painter.setFont(QFont("Helvetica", 9))
+        painter.setFont(QFont("Helvetica", 12))
         for idx in (0, len(clean) // 2, len(clean) - 1):
             ts = _ts(clean[idx])
             if ts <= 0:
                 continue
             label = datetime.datetime.fromtimestamp(ts / 1000).strftime("%m-%d %H:%M")
             x = x_of(idx)
-            label_x = min(max(x - 60, 2), width - 124)
-            painter.drawText(QRectF(label_x, height - bottom + 8, 120, 18),
+            label_x = min(max(x - 75, 2), width - 154)
+            painter.drawText(QRectF(label_x, height - bottom + 12, 150, 22),
                              Qt.AlignmentFlag.AlignCenter, label)
 
         # 图例（右上，避开底部时间轴）
-        painter.setFont(QFont("Helvetica", 10))
+        painter.setFont(QFont("Helvetica", 13))
         painter.setPen(QPen(QColor(_EMA), 1.8))
-        legend_x = width - right - 130
-        painter.drawLine(QPointF(legend_x, 22), QPointF(legend_x + 24, 22))
+        legend_x = width - right - 170
+        painter.drawLine(QPointF(legend_x, 28), QPointF(legend_x + 30, 28))
         painter.setPen(QPen(QColor(_TEXT), 1))
-        painter.drawText(QRectF(legend_x + 30, 12, 100, 18),
+        painter.drawText(QRectF(legend_x + 38, 15, 130, 22),
                          Qt.AlignmentFlag.AlignLeft, f"EMA{ema_period}")
     finally:
         painter.end()
