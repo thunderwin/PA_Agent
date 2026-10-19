@@ -213,7 +213,7 @@ class TelegramApprovalService:
                     continue
                 data_str = str(cq.get("data") or "")
                 action, _, plan_id = data_str.partition(":")
-                if action in ("close", "closeall"):
+                if action in ("close", "closeall", "noop"):
                     self._answer_callback(str(cq.get("id") or ""), "处理中…")
                     if self._on_callback:
                         try:

@@ -5101,7 +5101,8 @@ class MainWindow(QMainWindow):
                 "可用命令：\n"
                 "/positions — 查看持仓\n"
                 "/close <品种> — 平掉某个仓位（如 /close BTC）\n"
-                "/closeall — 一键全部平仓（需再确认）"
+                "/closeall — 一键全部平仓（需再确认）\n"
+                "/testalert — 发一条测试提醒（带 K 线图，不会下单）"
             )
         elif cmd in ("/positions", "/pos"):
             self._tg_send_positions()
@@ -5116,8 +5117,48 @@ class MainWindow(QMainWindow):
                     "⚠️ 确定要平掉<b>全部仓位</b>吗？",
                     [[("🔴 确认全部平仓", "closeall:confirm"), ("取消", "closeall:cancel")]],
                 )
+        elif cmd == "/testalert":
+            self._tg_send_test_alert()
         else:
             self._tg_reply("未知命令。发送 /help 查看可用命令。")
+
+    def _tg_send_test_alert(self) -> None:
+        """发一条测试提醒：真实 K 线图 + 按钮，但不会产生订单。"""
+        symbol = "BTC-USDT-SWAP"
+        timeframe = self._watchlist_timeframe()
+        try:
+            import tempfile
+            import time as _time
+
+            from pa_agent.notify.chart_image import render_kline_png
+
+            bars = self._fetch_chart_bars(symbol, timeframe)
+            price = float(getattr(bars[0], "close", 0) or 0)
+            if price <= 0:
+                self._tg_reply("测试提醒失败：拿不到最新价")
+                return
+            stop = round(price * 0.99, 2)
+            tp = round(price + 3 * (price - stop), 2)
+            path = os.path.join(
+                tempfile.gettempdir(), f"pa_testalert_{int(_time.time())}.png"
+            )
+            render_kline_png(
+                bars, path,
+                title=f"{symbol} {timeframe} | 最近 100 根 + EMA20（测试）",
+                levels=[(price, "示例入场", "#f5c542"),
+                        (stop, "示例止损", "#ef5350"),
+                        (tp, "示例止盈", "#26a69a")],
+            )
+            caption = (
+                "🧪 <b>测试提醒</b>（不会下单）\n"
+                f"{symbol} · {timeframe}\n"
+                f"最新价：<code>{price:.8g}</code>\n"
+                "这是用来检查图表、按钮和通知链路的测试消息。"
+            )
+            if getattr(self, "_telegram", None) is not None:
+                self._telegram.send_photo(caption, path, [[("知道了", "noop:test")]])
+        except Exception as exc:  # noqa: BLE001
+            self._tg_reply(f"测试提醒失败：{exc}")
 
     def _tg_send_positions(self) -> None:
         settings = self._ctx.settings
@@ -5174,7 +5215,9 @@ class MainWindow(QMainWindow):
 
     def _on_telegram_callback(self, data: str) -> None:
         action, _, arg = str(data or "").partition(":")
-        if action == "close":
+        if action == "noop":
+            self._tg_reply("✅ 按钮正常，测试完成。")
+        elif action == "close":
             self._tg_close_symbol(arg)
         elif action == "closeall" and arg == "confirm":
             self._tg_close_all()
