@@ -522,6 +522,7 @@ class MainWindow(QMainWindow):
         self._pending_tg_plans: dict[str, dict[str, Any]] = {}
         #: 用户点过「跳过」的品种：{symbol: {direction, entry, ts}}，用于同品种同方向冷却
         self._tg_skipped: dict[str, dict[str, Any]] = {}
+        self._load_skip_cooldowns()
         self._telegram: Any = None
         self.telegram_action.connect(self._on_telegram_trade_action)
         self._init_telegram()
@@ -4940,6 +4941,41 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             logger.warning("Telegram 初始化失败：%s", exc)
 
+    # ── 「跳过」冷却持久化（重启后仍然有效）─────────────────────────────────
+
+    def _skip_cooldown_path(self) -> Any:
+        from pa_agent.config.paths import RECORDS_PENDING_DIR
+
+        return RECORDS_PENDING_DIR.parent / "telegram_skip_cooldowns.json"
+
+    def _load_skip_cooldowns(self) -> None:
+        try:
+            import json
+
+            path = self._skip_cooldown_path()
+            if not path.exists():
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self._tg_skipped = {
+                    str(k): v for k, v in data.items() if isinstance(v, dict)
+                }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取跳过冷却记录失败：%s", exc)
+
+    def _save_skip_cooldowns(self) -> None:
+        try:
+            import json
+
+            path = self._skip_cooldown_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(self._tg_skipped, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("保存跳过冷却记录失败：%s", exc)
+
     def _fetch_chart_bars(self, symbol: str, timeframe: str) -> list[Any]:
         """取最近 100 根 K 线（用于 Telegram 图片）。"""
         from pa_agent.data.factory import create_data_source
@@ -5099,6 +5135,7 @@ class MainWindow(QMainWindow):
                 "entry": float(price or 0.0),
                 "ts": _time.time(),
             }
+            self._save_skip_cooldowns()
             self._tg_reply(f"已跳过 {symbol}。")
             return
         settings = self._ctx.settings
@@ -5212,6 +5249,7 @@ class MainWindow(QMainWindow):
             self._tg_send_test_alert()
         elif cmd == "/resume":
             self._tg_skipped.clear()
+            self._save_skip_cooldowns()
             self._tg_reply("已清除所有「跳过」冷却，下一轮会正常提醒。")
         else:
             self._tg_reply("未知命令。发送 /help 查看可用命令。")
