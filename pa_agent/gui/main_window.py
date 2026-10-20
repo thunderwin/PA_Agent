@@ -520,6 +520,8 @@ class MainWindow(QMainWindow):
         self._watchlist_watchdog.start()
         # Telegram 交易提醒 + 人工确认（trigger_mode=notify 时生效）
         self._pending_tg_plans: dict[str, dict[str, Any]] = {}
+        #: 用户点过「跳过」的品种：{symbol: {direction, entry, ts}}，用于同品种同方向冷却
+        self._tg_skipped: dict[str, dict[str, Any]] = {}
         self._telegram: Any = None
         self.telegram_action.connect(self._on_telegram_trade_action)
         self._init_telegram()
@@ -4971,6 +4973,22 @@ class MainWindow(QMainWindow):
         import threading
         import time as _time
 
+        # 2026-10-20 修：用户明确「跳过」后，同一品种同方向在冷却期内不再提醒。
+        tg_cfg = getattr(settings, "telegram", None)
+        cooldown_min = int(getattr(tg_cfg, "skip_cooldown_min", 120) or 0)
+        direction_now = str(decision.get("order_direction") or "")
+        prev = self._tg_skipped.get(symbol)
+        from pa_agent.notify.telegram_approval import skip_cooldown_active
+
+        if skip_cooldown_active(
+            prev, direction_now, now=_time.time(), cooldown_min=cooldown_min
+        ):
+            logger.warning(
+                "Telegram 提醒抑制：%s 在 %d 分钟内已被手动跳过同方向（%s），不再重复提醒",
+                symbol, cooldown_min, direction_now,
+            )
+            return
+
         def _run() -> None:
             from pa_agent.trading.gateway import create_trader
 
@@ -5051,6 +5069,10 @@ class MainWindow(QMainWindow):
                     tg.send_photo(caption, image_path, rows)
                 else:
                     tg.send_keyboard(caption, rows)
+                logger.warning(
+                    "Telegram 提醒已发送：%s %s 置信度 %s（计划入场 %s）",
+                    symbol, direction, confidence, entry,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Telegram 发送失败：%s", exc)
 
@@ -5068,13 +5090,18 @@ class MainWindow(QMainWindow):
             self._tg_reply(f"{plan.get('symbol')} 的提醒已过期，未下单。")
             return
         symbol = str(plan.get("symbol") or "")
+        decision = plan["decision"]
+        price = plan.get("price")
         if action not in ("exec", "market"):
             logger.warning("Telegram：用户跳过 %s", symbol)
+            self._tg_skipped[symbol] = {
+                "direction": str(decision.get("order_direction") or ""),
+                "entry": float(price or 0.0),
+                "ts": _time.time(),
+            }
             self._tg_reply(f"已跳过 {symbol}。")
             return
         settings = self._ctx.settings
-        decision = plan["decision"]
-        price = plan.get("price")
         market_entry = action == "market"
 
         import threading
@@ -5162,6 +5189,7 @@ class MainWindow(QMainWindow):
                 "/close <品种> — 平掉某个仓位（如 /close BTC）\n"
                 "/closeall — 一键全部平仓（需再确认）\n"
                 "/testalert — 发一条测试提醒（带 K 线图，不会下单）\n\n"
+                "/resume — 清除「跳过」冷却，下一轮正常提醒\n\n"
                 "提醒里的按钮：\n"
                 "✅ 按计划挂单（AI 的限价，等回撤）\n"
                 "⚡ 直接入场（按现价市价成交，止损照带）\n"
@@ -5182,6 +5210,9 @@ class MainWindow(QMainWindow):
                 )
         elif cmd == "/testalert":
             self._tg_send_test_alert()
+        elif cmd == "/resume":
+            self._tg_skipped.clear()
+            self._tg_reply("已清除所有「跳过」冷却，下一轮会正常提醒。")
         else:
             self._tg_reply("未知命令。发送 /help 查看可用命令。")
 

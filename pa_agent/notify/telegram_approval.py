@@ -24,6 +24,21 @@ logger = logging.getLogger(__name__)
 API_BASE = "https://api.telegram.org"
 
 
+def skip_cooldown_active(
+    prev: dict[str, Any] | None,
+    direction: str,
+    *,
+    now: float,
+    cooldown_min: int,
+) -> bool:
+    """用户点过「跳过」后，同品种同方向是否仍在冷却期（2026-10-20 加）。"""
+    if not prev or cooldown_min <= 0:
+        return False
+    if str(prev.get("direction") or "") != str(direction or ""):
+        return False
+    return now - float(prev.get("ts", 0) or 0) < cooldown_min * 60
+
+
 class TelegramApprovalService:
     """发送带按钮的交易提醒，并轮询用户的选择。"""
 

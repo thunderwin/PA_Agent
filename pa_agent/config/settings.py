@@ -287,6 +287,9 @@ class TelegramSettings(BaseModel):
     chat_id: str = ""
     #: 待确认方案的有效期（分钟），过期后按钮失效、不会下单。
     approval_timeout_min: int = Field(default=30, ge=1, le=1440)
+    #: 用户点「跳过」后，同一品种**同方向**的提醒冷却时间（分钟）。
+    #: 2026-10-20 加：用户明确跳过黄金做空后，下一小时又收到几乎相同的提醒。
+    skip_cooldown_min: int = Field(default=120, ge=0, le=1440)
 
 
 class Settings(BaseModel):
