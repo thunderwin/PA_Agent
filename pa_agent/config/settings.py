@@ -207,6 +207,9 @@ class TradingSettings(BaseModel):
     #: 固定止盈盈亏比：>0 时忽略 AI 给的止盈价，按 止盈=入场±N×止损距离 重算。
     #: 2026-10-12 用户定为 3.0（1:3）；止损**不会被程序改写**，仓位由以损定量控制。
     risk_reward_ratio: float = Field(default=3.0, ge=0.0, le=100.0)
+    #: 第一段止盈平掉多少比例（0-1）。2026-10-22 用户要求：1:1 止盈平 50%，
+    #: 剩下 50% 继续持有（止损仍覆盖剩余仓位，不设第二止盈）。
+    take_profit_fraction: float = Field(default=1.0, gt=0.0, le=1.0)
     #: 是否把止盈一并挂到交易所。
     #: False（默认）= 只挂止损，止盈由人工了结；True = 恢复"止损+止盈一起托管"。
     attach_take_profit: bool = True

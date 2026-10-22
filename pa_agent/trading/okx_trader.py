@@ -412,6 +412,7 @@ class OkxPrivateClient:
         trigger_px: float | None = None,
         stop_px: float | None = None,
         take_profit_px: float | None = None,
+        take_profit_size: float | None = None,
         td_mode: str = "cross",
         pos_side: str | None = "net",
         tag: str = ORDER_TAG,
@@ -441,15 +442,22 @@ class OkxPrivateClient:
             body["triggerPx"] = _fmt_num(trigger_px)
             body["orderPx"] = "-1"  # 触发后市价成交
 
-        algo: dict[str, Any] = {}
+        # 2026-10-22：止损与止盈分成两条 attachAlgoOrds，止盈可用 closeFraction
+        # 只平一部分（OKX 实测接受）。止损那条不带 closeFraction = 覆盖整个剩余仓位。
+        algos: list[dict[str, Any]] = []
         if stop_px is not None:
-            algo["slTriggerPx"] = _fmt_num(stop_px)
-            algo["slOrdPx"] = "-1"
+            algos.append({"slTriggerPx": _fmt_num(stop_px), "slOrdPx": "-1"})
         if take_profit_px is not None:
-            algo["tpTriggerPx"] = _fmt_num(take_profit_px)
-            algo["tpOrdPx"] = "-1"
-        if algo:
-            body["attachAlgoOrds"] = [algo]
+            tp_algo: dict[str, Any] = {
+                "tpTriggerPx": _fmt_num(take_profit_px),
+                "tpOrdPx": "-1",
+            }
+            if take_profit_size is not None and 0 < take_profit_size < size:
+                frac = min(max(take_profit_size / size, 0.01), 0.99)
+                tp_algo["closeFraction"] = f"{frac:.4f}".rstrip("0").rstrip(".")
+            algos.append(tp_algo)
+        if algos:
+            body["attachAlgoOrds"] = algos
 
         data = self.request("POST", "/api/v5/trade/order", body=body)
         row = data[0] if isinstance(data, list) and data else {}
@@ -528,6 +536,8 @@ class OrderPlan:
     leverage: int
     stop_distance: float = 0.0  # 入场价与止损价的距离（价格单位）
     base_qty: float = 0.0  # 折算成基础币的数量（现货即 size）
+    #: 止盈要平的张数（2026-10-22：默认只平 50%，剩下的继续跑）
+    take_profit_size: float = 0.0
     notes: tuple[str, ...] = ()
 
     @property
@@ -592,6 +602,7 @@ def plan_order(
     price: float | None = None,
     max_notional_usd: float = 0.0,
     risk_reward_ratio: float = 0.0,
+    take_profit_fraction: float = 1.0,
 ) -> OrderPlan:
     """把阶段二决策翻译成具体订单，并保证止损亏损 ≤ ``max_loss_usd``。
 
@@ -699,6 +710,16 @@ def plan_order(
 
     notional_usd = size * unit_notional
     tick = spec.tick_sz or 0.0
+    # 部分止盈：只平 fraction 比例的仓位（合约按 step 向下取整；不足一张就整仓）
+    tp_size = size
+    frac = min(max(float(take_profit_fraction or 1.0), 0.0), 1.0)
+    if tp and frac < 1.0:
+        tp_size = _floor_to_step(size * frac, lot)
+        if tp_size < (spec.min_sz or lot):
+            tp_size = size
+            notes.append("仓位不足一张，止盈改为全平")
+        else:
+            notes.append(f"止盈只平 {frac:.0%}（{_fmt_num(tp_size)} 张），其余继续持有")
     if ord_type == "market":
         plan_price = _round_to_tick(price, tick) if price else None
     else:
@@ -714,6 +735,7 @@ def plan_order(
         take_profit_px=_round_to_tick(tp, tick) if tp else None,
         risk_usd=risk_usd,
         notional_usd=notional_usd,
+        take_profit_size=tp_size,
         leverage=max(int(leverage), 1),
         stop_distance=risk_per_unit,
         base_qty=(size * spec.ct_val) if spec.derivative else size,
@@ -1011,6 +1033,7 @@ class OkxTrader:
             price=price,
             max_notional_usd=float(getattr(s, "max_notional_usd", 0.0) or 0.0),
             risk_reward_ratio=float(getattr(s, "risk_reward_ratio", 0.0) or 0.0),
+            take_profit_fraction=float(getattr(s, "take_profit_fraction", 1.0) or 1.0),
         )
         if dry_run:
             return ExecutionResult(
@@ -1035,6 +1058,7 @@ class OkxTrader:
             trigger_px=plan.price if plan.ord_type == "trigger" else None,
             stop_px=plan.stop_px,
             take_profit_px=plan.take_profit_px if attach_tp else None,
+            take_profit_size=plan.take_profit_size if attach_tp else None,
             td_mode="cross" if spec.derivative else "cash",
         )
         return ExecutionResult(

@@ -4908,8 +4908,70 @@ class MainWindow(QMainWindow):
                 except Exception as exc:  # noqa: BLE001
                     outcome = exc
             self.trade_finished.emit(outcome, symbol)
+            if getattr(outcome, "sent", False):
+                try:
+                    self._send_auto_order_notice(
+                        symbol,
+                        str(getattr(result, "timeframe", "") or self._watchlist_timeframe()),
+                        outcome,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Telegram 自动下单通知失败：%s", exc)
 
         threading.Thread(target=_run, name=f"okx-auto-{symbol}", daemon=True).start()
+
+    def _send_auto_order_notice(self, symbol: str, timeframe: str, outcome: Any) -> None:
+        """自动下单成功后的 Telegram 通知（带图，不需要确认）。"""
+        tg = getattr(self, "_telegram", None)
+        plan = getattr(outcome, "plan", None)
+        if tg is None or plan is None:
+            return
+        import tempfile
+        import time as _time
+
+        from pa_agent.notify.chart_image import render_kline_png
+
+        entry = float(getattr(plan, "price", 0.0) or 0.0)
+        stop = float(getattr(plan, "stop_px", 0.0) or 0.0)
+        tp = float(getattr(plan, "take_profit_px", 0.0) or 0.0)
+        image_path = ""
+        try:
+            bars = self._fetch_chart_bars(symbol, timeframe)
+            image_path = os.path.join(
+                tempfile.gettempdir(),
+                f"pa_filled_{symbol.split('-')[0]}_{int(_time.time())}.png",
+            )
+            if not render_kline_png(
+                bars,
+                image_path,
+                title=f"{symbol} {timeframe} | 最近 {len(bars)} 根 + EMA20",
+                levels=[(entry, "入场", "#f5c542"), (stop, "止损", "#ef5350"),
+                        (tp, "止盈", "#26a69a")],
+            ):
+                image_path = ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("自动下单通知图生成失败：%s", exc)
+            image_path = ""
+        tp_size = float(getattr(plan, "take_profit_size", 0.0) or 0.0)
+        size = float(getattr(plan, "size", 0.0) or 0.0)
+        tp_note = (
+            f"（平 {tp_size / size:.0%}，其余继续持有）" if 0 < tp_size < size else ""
+        )
+        caption = (
+            f"✅ <b>已自动下单</b>\n"
+            f"{symbol}（{timeframe}）· {str(getattr(plan, 'side', ''))}\n"
+            f"入场：<code>{entry:.8g}</code>\n"
+            f"止损：<code>{stop:.8g}</code>\n"
+            f"止盈：<code>{tp:.8g}</code>{tp_note}\n"
+            f"数量：{size:.8g} · 名义 {float(getattr(plan, 'notional_usd', 0.0)):.2f} USDT\n"
+            f"风险：<b>{float(getattr(plan, 'risk_usd', 0.0)):.2f} USDT</b>\n"
+            f"订单号：<code>{str(getattr(outcome, 'ord_id', ''))}</code>"
+        )
+        rows = [[("知道了", f"noop:auto{int(_time.time())}")]]
+        if image_path:
+            tg.send_photo(caption, image_path, rows)
+        else:
+            tg.send_keyboard(caption, rows)
 
     # ── Telegram：交易提醒 + 人工确认 + 持仓命令 ─────────────────────────────
 

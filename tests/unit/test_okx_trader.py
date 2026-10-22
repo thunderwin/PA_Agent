@@ -203,7 +203,8 @@ def test_place_order_body_includes_algo_stop_and_profit(monkeypatch):
         "px": "85000",
         "tag": "PAAGENT",           # 程序下的单都带标记，便于只清理自己的挂单
         "attachAlgoOrds": [
-            {"slTriggerPx": "84900", "slOrdPx": "-1", "tpTriggerPx": "85200", "tpOrdPx": "-1"}
+            {"slTriggerPx": "84900", "slOrdPx": "-1"},
+            {"tpTriggerPx": "85200", "tpOrdPx": "-1"},
         ],
     }
 
@@ -932,3 +933,40 @@ def test_effective_max_loss_falls_back_to_fixed_usd():
     # 百分比开着但权益读不到 → 退回固定金额，避免算出 0 风险
     s2 = SimpleNamespace(max_loss_per_trade_pct=0.5, max_loss_per_trade_usd=2.0)
     assert effective_max_loss_usd(s2, 0.0) == pytest.approx(2.0)
+
+
+# ── 1:1 止盈只平 50%（2026-10-22 用户要求）─────────────────────────────────
+
+
+def test_plan_order_partial_take_profit_size():
+    plan = plan_order(
+        _decision(entry_price=85000.0, stop_loss_price=84000.0, take_profit_price=86000.0),
+        BTC_SWAP, equity_usd=10_000.0, max_loss_usd=10.0, leverage=10,
+        risk_reward_ratio=1.0, take_profit_fraction=0.5,
+    )
+    assert plan.take_profit_px == pytest.approx(86000.0)        # 1:1
+    assert plan.take_profit_size == pytest.approx(plan.size / 2)  # 只平一半
+
+
+def test_place_order_sends_two_attach_algos_with_close_fraction(monkeypatch):
+    """OKX：止损一条（全仓）+ 止盈一条（closeFraction=0.5），实测接受。"""
+    from pa_agent.trading.okx_trader import OkxCredentials, OkxPrivateClient
+
+    cred = OkxCredentials(api_key="k", secret_key="s", passphrase="p")
+    client = OkxPrivateClient(cred)
+    captured: dict = {}
+
+    def _fake_request(method, path, *, body=None, **_kw):
+        captured["body"] = body
+        return [{"ordId": "1", "sCode": "0"}]
+
+    monkeypatch.setattr(client, "request", _fake_request)
+    client.place_order(
+        inst_id="BTC-USDT-SWAP", side="buy", ord_type="limit", size=10,
+        price=85000, stop_px=84000, take_profit_px=86000, take_profit_size=5,
+    )
+    algos = captured["body"]["attachAlgoOrds"]
+    assert len(algos) == 2
+    assert algos[0]["slTriggerPx"] == "84000" and "closeFraction" not in algos[0]
+    assert algos[1]["tpTriggerPx"] == "86000"
+    assert algos[1]["closeFraction"] == "0.5"
