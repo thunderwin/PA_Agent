@@ -5058,14 +5058,21 @@ class MainWindow(QMainWindow):
                 f"⏳ {timeout_min} 分钟内有效"
             )
             image_path = ""
+            entry_dist_atr = 0.0
             try:
                 import tempfile
 
                 from pa_agent.notify.chart_image import render_kline_png
+                from pa_agent.orchestrator.screener import atr_pct_of
+                from pa_agent.util.trade_metrics import stop_atr_multiple
 
                 bars = self._fetch_chart_bars(symbol, timeframe)
                 if bars:
                     price_now = float(getattr(bars[0], "close", 0) or 0)
+                    atr_pct = atr_pct_of(bars)
+                    if price_now > 0 and atr_pct > 0:
+                        atr_val = atr_pct / 100.0 * price_now
+                        entry_dist_atr = stop_atr_multiple(entry, price_now, atr_val) or 0.0
                 image_path = os.path.join(
                     tempfile.gettempdir(), f"pa_chart_{symbol.split('-')[0]}_{int(_time.time())}.png"
                 )
@@ -5087,6 +5094,20 @@ class MainWindow(QMainWindow):
                 caption = caption.replace(
                     f"置信度：{confidence}",
                     f"现价：<code>{price_now:.8g}</code>\n置信度：{confidence}",
+                )
+            max_dist = float(getattr(tg_cfg, "max_entry_distance_atr", 2.0) or 0.0)
+            far_mode = str(getattr(tg_cfg, "far_entry_mode", "label") or "label").lower()
+            if max_dist > 0 and entry_dist_atr > max_dist:
+                logger.warning(
+                    "Telegram 提醒：%s 入场偏远 %.2f×ATR（阈值 %.1f）",
+                    symbol, entry_dist_atr, max_dist,
+                )
+                if far_mode == "suppress":
+                    logger.warning("Telegram 提醒抑制：%s 入场偏远 %.2f×ATR", symbol, entry_dist_atr)
+                    return
+                caption = caption.replace(
+                    "出现交易机会",
+                    f"出现交易机会 ⚠️ 入场偏远 {entry_dist_atr:.1f}×ATR",
                 )
             plan_id = f"{symbol}:{int(_time.time())}"
             self._pending_tg_plans[plan_id] = {

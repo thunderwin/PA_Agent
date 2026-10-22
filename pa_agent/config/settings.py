@@ -290,6 +290,10 @@ class TelegramSettings(BaseModel):
     #: 用户点「跳过」后，同一品种**同方向**的提醒冷却时间（分钟）。
     #: 2026-10-20 加：用户明确跳过黄金做空后，下一小时又收到几乎相同的提醒。
     skip_cooldown_min: int = Field(default=120, ge=0, le=1440)
+    #: 入场价离现价超过 N×ATR 视为"偏远"（0 = 不检查）。
+    max_entry_distance_atr: float = Field(default=2.0, ge=0.0, le=20.0)
+    #: 偏远时怎么处理：label = 照发但明确标红；suppress = 不发提醒。
+    far_entry_mode: str = "label"
 
 
 class Settings(BaseModel):
