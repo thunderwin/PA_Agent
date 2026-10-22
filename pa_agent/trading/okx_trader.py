@@ -340,6 +340,14 @@ class OkxPrivateClient:
         data = self.request("GET", "/api/v5/trade/orders-algo-pending", params=params)
         return list(data or [])
 
+    def order_state(self, inst_id: str, ord_id: str) -> dict[str, Any]:
+        """查单笔订单状态（成交监听用）：state / accFillSz / avgPx。"""
+        data = self.request(
+            "GET", "/api/v5/trade/order", params={"instId": inst_id, "ordId": ord_id}
+        )
+        row = data[0] if isinstance(data, list) and data else {}
+        return row if isinstance(row, dict) else {}
+
     def open_position_count(self, inst_type: str | None = None) -> int:
         rows = self.positions(inst_type=inst_type)
         return sum(1 for r in rows if abs(_as_float(r.get("pos")) or 0.0) > 0)

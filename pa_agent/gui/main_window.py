@@ -523,6 +523,9 @@ class MainWindow(QMainWindow):
         #: 用户点过「跳过」的品种：{symbol: {direction, entry, ts}}，用于同品种同方向冷却
         self._tg_skipped: dict[str, dict[str, Any]] = {}
         self._load_skip_cooldowns()
+        #: 已下单、等待成交的订单：{ord_id: {...}}，只有成交才发 Telegram
+        self._pending_fill_notices: dict[str, dict[str, Any]] = {}
+        self._load_fill_notices()
         self._telegram: Any = None
         self.telegram_action.connect(self._on_telegram_trade_action)
         self._init_telegram()
@@ -4814,6 +4817,7 @@ class MainWindow(QMainWindow):
         """交易看守定时器（每 2 分钟）：补挂止损体检 + 过期入场挂单清理。"""
         self._ensure_stops()
         self._expire_stale_entries()
+        self._check_fill_notices()
 
     def _expire_stale_entries(self) -> None:
         """按 settings.trading.pending_entry_expiry_bars 撤掉过期的入场挂单。
@@ -4910,68 +4914,171 @@ class MainWindow(QMainWindow):
             self.trade_finished.emit(outcome, symbol)
             if getattr(outcome, "sent", False):
                 try:
-                    self._send_auto_order_notice(
+                    self._register_fill_notice(
                         symbol,
                         str(getattr(result, "timeframe", "") or self._watchlist_timeframe()),
                         outcome,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("Telegram 自动下单通知失败：%s", exc)
+                    logger.warning("登记成交通知失败：%s", exc)
 
         threading.Thread(target=_run, name=f"okx-auto-{symbol}", daemon=True).start()
 
-    def _send_auto_order_notice(self, symbol: str, timeframe: str, outcome: Any) -> None:
-        """自动下单成功后的 Telegram 通知（带图，不需要确认）。"""
-        tg = getattr(self, "_telegram", None)
+    # ── 成交通知（2026-10-22：只有成交才通知，挂单不通知）────────────────────
+
+    def _fill_notice_path(self) -> Any:
+        from pa_agent.config.paths import RECORDS_PENDING_DIR
+
+        return RECORDS_PENDING_DIR.parent / "pending_fill_notices.json"
+
+    def _load_fill_notices(self) -> None:
+        try:
+            import json
+
+            path = self._fill_notice_path()
+            if not path.exists():
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self._pending_fill_notices = {
+                    str(k): v for k, v in data.items() if isinstance(v, dict)
+                }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取待成交通知失败：%s", exc)
+
+    def _save_fill_notices(self) -> None:
+        try:
+            import json
+
+            path = self._fill_notice_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(self._pending_fill_notices, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("保存待成交通知失败：%s", exc)
+
+    def _register_fill_notice(self, symbol: str, timeframe: str, outcome: Any) -> None:
+        """下单成功只登记，不发通知；成交后由 _check_fill_notices 发。"""
         plan = getattr(outcome, "plan", None)
-        if tg is None or plan is None:
+        ord_id = str(getattr(outcome, "ord_id", "") or "")
+        if plan is None or not ord_id:
             return
-        import tempfile
-        import time as _time
+        self._pending_fill_notices[ord_id] = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "side": str(getattr(plan, "side", "")),
+            "size": float(getattr(plan, "size", 0.0) or 0.0),
+            "entry": float(getattr(plan, "price", 0.0) or 0.0),
+            "stop": float(getattr(plan, "stop_px", 0.0) or 0.0),
+            "tp": float(getattr(plan, "take_profit_px", 0.0) or 0.0),
+            "tp_size": float(getattr(plan, "take_profit_size", 0.0) or 0.0),
+            "risk_usd": float(getattr(plan, "risk_usd", 0.0) or 0.0),
+            "notional_usd": float(getattr(plan, "notional_usd", 0.0) or 0.0),
+            "ts": __import__("time").time(),
+        }
+        self._save_fill_notices()
+        logger.warning("已登记成交通知：%s 订单 %s（成交后才发 Telegram）", symbol, ord_id)
 
-        from pa_agent.notify.chart_image import render_kline_png
+    def _check_fill_notices(self) -> None:
+        """每 2 分钟查一次未成交订单；成交才发通知，撤单则静默丢弃。"""
+        pending = dict(getattr(self, "_pending_fill_notices", {}) or {})
+        if not pending or getattr(self, "_telegram", None) is None:
+            return
+        settings = self._ctx.settings
 
-        entry = float(getattr(plan, "price", 0.0) or 0.0)
-        stop = float(getattr(plan, "stop_px", 0.0) or 0.0)
-        tp = float(getattr(plan, "take_profit_px", 0.0) or 0.0)
+        import threading
+
+        def _run() -> None:
+            from pa_agent.trading.gateway import create_trader
+
+            try:
+                trader = create_trader(settings)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("成交通知查询失败：%s", exc)
+                return
+            for ord_id, info in pending.items():
+                symbol = str(info.get("symbol") or "")
+                try:
+                    row = trader.client.order_state(symbol, ord_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("查询订单 %s 状态失败：%s", ord_id, exc)
+                    continue
+                state = str(row.get("state") or "")
+                filled = float(row.get("accFillSz") or 0.0)
+                if filled > 0 or state == "filled":
+                    avg = float(row.get("avgPx") or info.get("entry") or 0.0)
+                    self._send_fill_notice(info, ord_id, avg, filled, state)
+                    self._pending_fill_notices.pop(ord_id, None)
+                    self._save_fill_notices()
+                elif state in ("canceled", "mmp_canceled"):
+                    logger.warning("订单未成交已撤销，不通知：%s %s", symbol, ord_id)
+                    self._pending_fill_notices.pop(ord_id, None)
+                    self._save_fill_notices()
+
+        threading.Thread(target=_run, name="fill-notice-check", daemon=True).start()
+
+    def _send_fill_notice(
+        self, info: dict[str, Any], ord_id: str, avg_px: float, filled_sz: float, state: str
+    ) -> None:
+        """真正成交后发 Telegram（带图）。"""
+        tg = getattr(self, "_telegram", None)
+        if tg is None:
+            return
+        symbol = str(info.get("symbol") or "")
+        timeframe = str(info.get("timeframe") or "")
+        entry = float(info.get("entry") or 0.0)
+        stop = float(info.get("stop") or 0.0)
+        tp = float(info.get("tp") or 0.0)
+        size = float(info.get("size") or 0.0)
+        tp_size = float(info.get("tp_size") or 0.0)
         image_path = ""
         try:
+            import tempfile
+            import time as _time
+
+            from pa_agent.notify.chart_image import render_kline_png
+
             bars = self._fetch_chart_bars(symbol, timeframe)
             image_path = os.path.join(
                 tempfile.gettempdir(),
-                f"pa_filled_{symbol.split('-')[0]}_{int(_time.time())}.png",
+                f"pa_fill_{symbol.split('-')[0]}_{int(_time.time())}.png",
             )
             if not render_kline_png(
                 bars,
                 image_path,
                 title=f"{symbol} {timeframe} | 最近 {len(bars)} 根 + EMA20",
-                levels=[(entry, "入场", "#f5c542"), (stop, "止损", "#ef5350"),
-                        (tp, "止盈", "#26a69a")],
+                levels=[
+                    (avg_px or entry, "成交", "#f5c542"),
+                    (stop, "止损", "#ef5350"),
+                    (tp, "止盈", "#26a69a"),
+                ],
             ):
                 image_path = ""
         except Exception as exc:  # noqa: BLE001
-            logger.warning("自动下单通知图生成失败：%s", exc)
+            logger.warning("成交通知图生成失败：%s", exc)
             image_path = ""
-        tp_size = float(getattr(plan, "take_profit_size", 0.0) or 0.0)
-        size = float(getattr(plan, "size", 0.0) or 0.0)
         tp_note = (
             f"（平 {tp_size / size:.0%}，其余继续持有）" if 0 < tp_size < size else ""
         )
+        partial = "（部分成交）" if state == "partially_filled" else ""
         caption = (
-            f"✅ <b>已自动下单</b>\n"
-            f"{symbol}（{timeframe}）· {str(getattr(plan, 'side', ''))}\n"
-            f"入场：<code>{entry:.8g}</code>\n"
+            f"✅ <b>订单已成交</b>{partial}\n"
+            f"{symbol}（{timeframe}）· {info.get('side')}\n"
+            f"成交均价：<code>{avg_px:.8g}</code>\n"
+            f"成交数量：{filled_sz:.8g} / {size:.8g}\n"
             f"止损：<code>{stop:.8g}</code>\n"
             f"止盈：<code>{tp:.8g}</code>{tp_note}\n"
-            f"数量：{size:.8g} · 名义 {float(getattr(plan, 'notional_usd', 0.0)):.2f} USDT\n"
-            f"风险：<b>{float(getattr(plan, 'risk_usd', 0.0)):.2f} USDT</b>\n"
-            f"订单号：<code>{str(getattr(outcome, 'ord_id', ''))}</code>"
+            f"计划风险：{float(info.get('risk_usd') or 0):.2f} USDT\n"
+            f"订单号：<code>{ord_id}</code>"
         )
-        rows = [[("知道了", f"noop:auto{int(_time.time())}")]]
+        rows = [[("知道了", f"noop:fill{int(__import__('time').time())}")]]
         if image_path:
             tg.send_photo(caption, image_path, rows)
         else:
             tg.send_keyboard(caption, rows)
+        logger.warning("成交通知已发送：%s %s 成交 %.8g @ %.8g", symbol, ord_id, filled_sz, avg_px)
 
     # ── Telegram：交易提醒 + 人工确认 + 持仓命令 ─────────────────────────────
 
@@ -5175,6 +5282,7 @@ class MainWindow(QMainWindow):
             self._pending_tg_plans[plan_id] = {
                 "decision": dict(decision),
                 "symbol": symbol,
+                "timeframe": timeframe,
                 "price": entry or None,
                 "price_now": price_now,
                 "expire_ts": _time.time() + timeout_min * 60,
@@ -5272,19 +5380,19 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001
                 outcome = exc
             self.trade_finished.emit(outcome, symbol)
-            # 点了「执行」之后，Telegram 里一定要有回执（否则像没反应）
+            # 2026-10-22：只在下单失败时回执；成功则等成交后再通知
             try:
-                tg = getattr(self, "_telegram", None)
-                if tg is not None:
-                    sent = bool(getattr(outcome, "sent", False))
-                    msg = str(getattr(outcome, "message", outcome))
-                    if sent:
-                        head = "⚡ <b>已按市价入场</b>" if market_entry else "✅ <b>已下单</b>"
-                    else:
-                        head = "❌ <b>下单未执行</b>"
-                    tg.send_html(f"{head}\n{symbol}\n{msg}")
+                if getattr(outcome, "sent", False):
+                    self._register_fill_notice(
+                        symbol, str(plan.get("timeframe") or ""), outcome
+                    )
+                else:
+                    tg = getattr(self, "_telegram", None)
+                    if tg is not None:
+                        msg = str(getattr(outcome, "message", outcome))
+                        tg.send_html(f"❌ <b>下单未执行</b>\n{symbol}\n{msg}")
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Telegram 下单回执发送失败：%s", exc)
+                logger.warning("下单结果处理失败：%s", exc)
 
         threading.Thread(target=_run, name=f"tg-exec-{symbol}", daemon=True).start()
 

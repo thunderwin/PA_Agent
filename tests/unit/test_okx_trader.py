@@ -970,3 +970,17 @@ def test_place_order_sends_two_attach_algos_with_close_fraction(monkeypatch):
     assert algos[0]["slTriggerPx"] == "84000" and "closeFraction" not in algos[0]
     assert algos[1]["tpTriggerPx"] == "86000"
     assert algos[1]["closeFraction"] == "0.5"
+
+
+def test_order_state_reads_fill_fields(monkeypatch):
+    """成交通知靠这个接口：state / accFillSz / avgPx。"""
+    from pa_agent.trading.okx_trader import OkxCredentials, OkxPrivateClient
+
+    client = OkxPrivateClient(OkxCredentials(api_key="k", secret_key="s", passphrase="p"))
+    monkeypatch.setattr(
+        client, "request",
+        lambda *a, **k: [{"state": "filled", "accFillSz": "2.37", "avgPx": "80001.5"}],
+    )
+    row = client.order_state("BTC-USDT-SWAP", "42")
+    assert row["state"] == "filled"
+    assert float(row["accFillSz"]) == pytest.approx(2.37)
