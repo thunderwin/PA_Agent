@@ -131,7 +131,7 @@ def test_watchlist_watchdog_noop_when_disabled(window, monkeypatch):
     assert calls == []
 
 
-def test_register_fill_notice_persists_without_sending(window, monkeypatch):
+def test_register_fill_notice_persists_without_sending(window, monkeypatch, tmp_path):
     """下单成功只登记，不立刻通知；成交后才由 _check_fill_notices 发送。"""
     from types import SimpleNamespace
 
@@ -139,6 +139,9 @@ def test_register_fill_notice_persists_without_sending(window, monkeypatch):
     monkeypatch.setattr(
         window, "_send_fill_notice", lambda *a, **k: sent.append(1)
     )
+    # 用临时路径，避免把测试订单写进真实的 records/pending_fill_notices.json
+    notice_path = tmp_path / "pending_fill_notices.json"
+    monkeypatch.setattr(window, "_fill_notice_path", lambda: notice_path)
     plan = SimpleNamespace(
         size=2.0, price=80000.0, stop_px=79600.0, take_profit_px=80400.0,
         take_profit_size=1.0, risk_usd=9.5, notional_usd=1600.0, side="buy",
@@ -147,4 +150,4 @@ def test_register_fill_notice_persists_without_sending(window, monkeypatch):
     window._register_fill_notice("BTC-USDT-SWAP", "1h", outcome)
     assert "ord-1" in window._pending_fill_notices
     assert sent == []                 # 没有立刻发
-    assert window._fill_notice_path().exists()
+    assert notice_path.exists()
