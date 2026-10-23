@@ -450,8 +450,8 @@ class OkxPrivateClient:
             body["triggerPx"] = _fmt_num(trigger_px)
             body["orderPx"] = "-1"  # 触发后市价成交
 
-        # 2026-10-22：止损与止盈分成两条 attachAlgoOrds，止盈可用 closeFraction
-        # 只平一部分（OKX 实测接受）。止损那条不带 closeFraction = 覆盖整个剩余仓位。
+        # 2026-10-23 实测结论：attachAlgoOrds 的 TP **永远按全仓**（sz/percent/
+        # closeFraction 都会被忽略）。部分止盈必须等成交后单独用 order-algo 挂。
         algos: list[dict[str, Any]] = []
         if stop_px is not None:
             algos.append({"slTriggerPx": _fmt_num(stop_px), "slOrdPx": "-1"})
@@ -460,10 +460,9 @@ class OkxPrivateClient:
                 "tpTriggerPx": _fmt_num(take_profit_px),
                 "tpOrdPx": "-1",
             }
-            if take_profit_size is not None and 0 < take_profit_size < size:
-                frac = min(max(take_profit_size / size, 0.01), 0.99)
-                tp_algo["closeFraction"] = f"{frac:.4f}".rstrip("0").rstrip(".")
-            algos.append(tp_algo)
+            # 只有"全平止盈"才随单附带；部分止盈留到成交后单独挂
+            if take_profit_size is None or take_profit_size >= size:
+                algos.append(tp_algo)
         if algos:
             body["attachAlgoOrds"] = algos
 
@@ -478,6 +477,35 @@ class OkxPrivateClient:
             size,
             row.get("ordId"),
         )
+        return dict(row)
+
+    def place_algo_take_profit(
+        self,
+        inst_id: str,
+        side: str,
+        size: float,
+        trigger_px: float,
+        *,
+        td_mode: str = "cross",
+        pos_side: str = "net",
+    ) -> dict[str, Any]:
+        """部分止盈：成交后单独挂 order-algo（sz 明确张数，实测只平指定数量）。"""
+        body: dict[str, Any] = {
+            "instId": inst_id,
+            "tdMode": td_mode,
+            "side": side,
+            "posSide": pos_side,
+            "ordType": "conditional",
+            "sz": _fmt_num(size),
+            "tpTriggerPx": _fmt_num(trigger_px),
+            "tpOrdPx": "-1",
+            "algoClOrdId": f"PAAGENT-TP-{int(time.time() * 1000) % 10**12}",
+        }
+        data = self.request("POST", "/api/v5/trade/order-algo", body=body)
+        row = data[0] if isinstance(data, list) and data else {}
+        if str(row.get("sCode", "0")) != "0":
+            raise OkxTradeError(f"部分止盈挂单被拒: {row.get('sMsg') or row}")
+        logger.warning("部分止盈已挂：%s %s %s 张 @ %s", inst_id, side, size, trigger_px)
         return dict(row)
 
     def cancel_order(self, inst_id: str, ord_id: str) -> dict[str, Any]:

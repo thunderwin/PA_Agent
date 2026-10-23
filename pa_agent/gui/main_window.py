@@ -5008,6 +5008,27 @@ class MainWindow(QMainWindow):
                 state = str(row.get("state") or "")
                 filled = float(row.get("accFillSz") or 0.0)
                 if filled > 0 or state == "filled":
+                    # 部分止盈：attachAlgoOrds 的 TP 只能全平，成交后单独补挂半仓 TP
+                    tp = float(info.get("tp") or 0.0)
+                    tp_size = float(info.get("tp_size") or 0.0)
+                    size = float(info.get("size") or 0.0)
+                    if (
+                        tp > 0
+                        and 0 < tp_size < size
+                        and not info.get("tp_placed")
+                    ):
+                        side = "sell" if str(info.get("side")) == "buy" else "buy"
+                        tp_qty = min(tp_size, filled / 2 if filled > 0 else tp_size)
+                        try:
+                            trader.client.place_algo_take_profit(
+                                symbol, side, tp_qty, tp
+                            )
+                            info["tp_placed"] = True
+                            info["tp_qty"] = tp_qty
+                            self._pending_fill_notices[ord_id] = info
+                            self._save_fill_notices()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("补挂部分止盈失败 %s：%s", symbol, exc)
                     avg = float(row.get("avgPx") or info.get("entry") or 0.0)
                     self._send_fill_notice(info, ord_id, avg, filled, state)
                     self._pending_fill_notices.pop(ord_id, None)

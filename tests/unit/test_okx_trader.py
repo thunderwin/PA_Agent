@@ -948,12 +948,12 @@ def test_plan_order_partial_take_profit_size():
     assert plan.take_profit_size == pytest.approx(plan.size / 2)  # 只平一半
 
 
-def test_place_order_sends_two_attach_algos_with_close_fraction(monkeypatch):
-    """OKX：止损一条（全仓）+ 止盈一条（closeFraction=0.5），实测接受。"""
+def test_place_order_partial_tp_only_attaches_stop(monkeypatch):
+    """2026-10-23 实测：attachAlgoOrds 的 TP 只能全平，所以部分止盈时
+    下单只带止损，TP 等成交后用 order-algo 单独挂。"""
     from pa_agent.trading.okx_trader import OkxCredentials, OkxPrivateClient
 
-    cred = OkxCredentials(api_key="k", secret_key="s", passphrase="p")
-    client = OkxPrivateClient(cred)
+    client = OkxPrivateClient(OkxCredentials(api_key="k", secret_key="s", passphrase="p"))
     captured: dict = {}
 
     def _fake_request(method, path, *, body=None, **_kw):
@@ -966,10 +966,47 @@ def test_place_order_sends_two_attach_algos_with_close_fraction(monkeypatch):
         price=85000, stop_px=84000, take_profit_px=86000, take_profit_size=5,
     )
     algos = captured["body"]["attachAlgoOrds"]
-    assert len(algos) == 2
-    assert algos[0]["slTriggerPx"] == "84000" and "closeFraction" not in algos[0]
-    assert algos[1]["tpTriggerPx"] == "86000"
-    assert algos[1]["closeFraction"] == "0.5"
+    assert len(algos) == 1
+    assert algos[0]["slTriggerPx"] == "84000"
+
+
+def test_place_order_full_tp_still_attaches_tp(monkeypatch):
+    from pa_agent.trading.okx_trader import OkxCredentials, OkxPrivateClient
+
+    client = OkxPrivateClient(OkxCredentials(api_key="k", secret_key="s", passphrase="p"))
+    captured: dict = {}
+
+    def _fake_request(method, path, *, body=None, **_kw):
+        captured["body"] = body
+        return [{"ordId": "1", "sCode": "0"}]
+
+    monkeypatch.setattr(client, "request", _fake_request)
+    client.place_order(
+        inst_id="BTC-USDT-SWAP", side="buy", ord_type="limit", size=10,
+        price=85000, stop_px=84000, take_profit_px=86000, take_profit_size=10,
+    )
+    algos = captured["body"]["attachAlgoOrds"]
+    assert len(algos) == 2 and algos[1]["tpTriggerPx"] == "86000"
+
+
+def test_place_algo_take_profit_uses_explicit_size(monkeypatch):
+    from pa_agent.trading.okx_trader import OkxCredentials, OkxPrivateClient
+
+    client = OkxPrivateClient(OkxCredentials(api_key="k", secret_key="s", passphrase="p"))
+    captured: dict = {}
+
+    def _fake_request(method, path, *, body=None, **_kw):
+        captured["path"] = path
+        captured["body"] = body
+        return [{"algoId": "9", "sCode": "0"}]
+
+    monkeypatch.setattr(client, "request", _fake_request)
+    client.place_algo_take_profit("BTC-USDT-SWAP", "sell", 5, 86000)
+    assert captured["path"] == "/api/v5/trade/order-algo"
+    body = captured["body"]
+    assert body["ordType"] == "conditional"
+    assert body["sz"] == "5"
+    assert body["tpTriggerPx"] == "86000"
 
 
 def test_order_state_reads_fill_fields(monkeypatch):
